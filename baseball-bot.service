@@ -1,0 +1,15 @@
+[Unit]
+Description=Baseball Pregame Analysis Bot
+After=network.target kb-engine.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/baseball-bot
+EnvironmentFile=/home/ubuntu/baseball-bot/.env
+ExecStart=/home/ubuntu/baseball-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

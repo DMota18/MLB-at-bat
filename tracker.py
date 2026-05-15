@@ -1,0 +1,633 @@
+"""
+Prediction tracker — stores predictions and checks results.
+
+SQLite database tracks every prediction and its outcome.
+After games complete, pulls box scores to determine who got hits.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import sqlite3
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from config import MLB_API, TIER_STRONG, TIER_LEAN, TIER_TOSSUP, american_to_prob
+from predictor import HitPrediction
+
+logger = logging.getLogger("baseball_bot.tracker")
+
+DB_PATH = Path(__file__).parent / "predictions.db"
+_tables_initialized = False
+
+
+def _init_tables(db: sqlite3.Connection) -> None:
+    """Create tables once per process."""
+    global _tables_initialized
+    if _tables_initialized:
+        return
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_pk INTEGER,
+            game_date TEXT,
+            batter_name TEXT,
+            batter_id INTEGER,
+            pitcher_name TEXT,
+            pitcher_id INTEGER,
+            venue TEXT,
+            prediction TEXT,
+            hit_probability REAL,
+            confidence TEXT,
+            edge TEXT,
+            actual_result TEXT DEFAULT NULL,
+            got_hit INTEGER DEFAULT NULL,
+            at_bats INTEGER DEFAULT NULL,
+            hits INTEGER DEFAULT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(game_pk, batter_id)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS book_odds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_pk INTEGER,
+            game_date TEXT,
+            batter_name TEXT,
+            batter_id INTEGER,
+            book TEXT,
+            line REAL DEFAULT 0.5,
+            over_price INTEGER,
+            under_price INTEGER,
+            implied_prob REAL,
+            model_prob REAL,
+            edge REAL,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS daily_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_date TEXT UNIQUE,
+            total_predictions INTEGER,
+            correct INTEGER,
+            incorrect INTEGER,
+            pending INTEGER,
+            accuracy REAL,
+            hit_predictions INTEGER,
+            hit_correct INTEGER,
+            no_hit_predictions INTEGER,
+            no_hit_correct INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS paper_bets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_pk INTEGER,
+            game_date TEXT,
+            batter_name TEXT,
+            batter_id INTEGER,
+            pitcher_name TEXT,
+            model_prob REAL,
+            confidence TEXT,
+            edge_tags TEXT,
+            book TEXT,
+            book_odds INTEGER,
+            implied_prob REAL,
+            edge REAL,
+            stake REAL DEFAULT 100,
+            result TEXT DEFAULT NULL,
+            got_hit INTEGER DEFAULT NULL,
+            pnl REAL DEFAULT NULL,
+            settled INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    db.commit()
+    _tables_initialized = True
+
+
+def _get_db() -> sqlite3.Connection:
+    """Get database connection, initializing tables on first call."""
+    db = sqlite3.connect(str(DB_PATH))
+    db.row_factory = sqlite3.Row
+    _init_tables(db)
+    return db
+
+
+def save_predictions(preds: list[HitPrediction]) -> None:
+    """Save multiple predictions. Duplicates (same game + batter) are updated."""
+    with contextlib.closing(_get_db()) as db:
+        db.executemany("""
+            INSERT OR REPLACE INTO predictions (
+                game_pk, game_date, batter_name, batter_id,
+                pitcher_name, pitcher_id, venue,
+                prediction, hit_probability, confidence, edge
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (p.game_pk, p.game_date, p.batter_name, p.batter_id,
+             p.pitcher_name, p.pitcher_id, p.venue,
+             p.prediction, p.hit_probability, p.confidence, p.edge)
+            for p in preds
+        ])
+        db.commit()
+
+
+# ── Results checker ──────────────────────────────────────────────────
+
+
+def check_results(game_date: str = None) -> dict[str, Any]:
+    """Check actual results for a date's predictions.
+
+    Pulls box scores from MLB API and updates the database.
+    """
+    if game_date is None:
+        game_date = (date.today() - timedelta(days=1)).isoformat()
+
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute(
+            "SELECT * FROM predictions WHERE game_date = ? AND actual_result IS NULL",
+            (game_date,)
+        ).fetchall()
+
+        if not rows:
+            return {"date": game_date, "checked": 0, "message": "No pending predictions"}
+
+        game_pks = set(r["game_pk"] for r in rows)
+        results_map: dict[int, dict[int, dict]] = {}
+
+        for gpk in game_pks:
+            try:
+                box = _fetch_boxscore(gpk)
+                if box:
+                    results_map[gpk] = box
+            except Exception as e:
+                logger.error(f"Failed to fetch boxscore for {gpk}: {e}")
+
+        updated = 0
+        for row in rows:
+            gpk = row["game_pk"]
+            bid = row["batter_id"]
+
+            if gpk not in results_map:
+                continue
+
+            player_stats = results_map[gpk].get(bid)
+            if player_stats is None:
+                db.execute(
+                    "UPDATE predictions SET actual_result = 'DNP' WHERE id = ?",
+                    (row["id"],)
+                )
+                updated += 1
+                continue
+
+            ab = player_stats.get("atBats", 0)
+            hits = player_stats.get("hits", 0)
+            got_hit = 1 if hits > 0 else 0
+
+            db.execute("""
+                UPDATE predictions SET
+                    actual_result = ?,
+                    got_hit = ?,
+                    at_bats = ?,
+                    hits = ?
+                WHERE id = ?
+            """, (
+                f"{hits}-for-{ab}" if ab > 0 else "0 AB",
+                got_hit, ab, hits, row["id"],
+            ))
+            updated += 1
+
+        db.commit()
+        summary = _compute_daily_summary(db, game_date)
+
+    return {"date": game_date, "checked": updated, "summary": summary}
+
+
+def _fetch_boxscore(game_pk: int) -> dict[int, dict] | None:
+    """Fetch box score and return batter_id -> hitting stats."""
+    try:
+        r = httpx.get(f"{MLB_API}/game/{game_pk}/boxscore", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning(f"Failed to fetch boxscore for game {game_pk}: {e}")
+        return None
+
+    result: dict[int, dict] = {}
+
+    for side in ["away", "home"]:
+        team = data.get("teams", {}).get(side, {})
+        players = team.get("players", {})
+        for key, pdata in players.items():
+            pid = pdata.get("person", {}).get("id", 0)
+            stats = pdata.get("stats", {}).get("batting", {})
+            if stats:
+                result[pid] = {
+                    "atBats": int(stats.get("atBats", 0)),
+                    "hits": int(stats.get("hits", 0)),
+                    "homeRuns": int(stats.get("homeRuns", 0)),
+                    "strikeOuts": int(stats.get("strikeOuts", 0)),
+                    "baseOnBalls": int(stats.get("baseOnBalls", 0)),
+                }
+
+    return result
+
+
+def _compute_daily_summary(db: sqlite3.Connection, game_date: str) -> dict[str, Any]:
+    """Compute accuracy summary for a date."""
+    rows = db.execute(
+        "SELECT * FROM predictions WHERE game_date = ? AND actual_result IS NOT NULL AND actual_result != 'DNP'",
+        (game_date,)
+    ).fetchall()
+
+    if not rows:
+        return {"total": 0, "message": "No results yet"}
+
+    total = len(rows)
+    correct = 0
+    hit_pred = 0
+    hit_correct = 0
+    no_hit_pred = 0
+    no_hit_correct = 0
+
+    for r in rows:
+        predicted_hit = r["prediction"] == "HIT"
+        actually_hit = r["got_hit"] == 1
+
+        if predicted_hit:
+            hit_pred += 1
+            if actually_hit:
+                correct += 1
+                hit_correct += 1
+        else:
+            no_hit_pred += 1
+            if not actually_hit:
+                correct += 1
+                no_hit_correct += 1
+
+    accuracy = correct / total if total > 0 else 0
+
+    summary = {
+        "total": total,
+        "correct": correct,
+        "incorrect": total - correct,
+        "accuracy": round(accuracy * 100, 1),
+        "hit_predictions": hit_pred,
+        "hit_correct": hit_correct,
+        "hit_accuracy": round(hit_correct / hit_pred * 100, 1) if hit_pred > 0 else 0,
+        "no_hit_predictions": no_hit_pred,
+        "no_hit_correct": no_hit_correct,
+        "no_hit_accuracy": round(no_hit_correct / no_hit_pred * 100, 1) if no_hit_pred > 0 else 0,
+    }
+
+    # Upsert daily summary
+    db.execute("""
+        INSERT OR REPLACE INTO daily_summary (
+            game_date, total_predictions, correct, incorrect, pending, accuracy,
+            hit_predictions, hit_correct, no_hit_predictions, no_hit_correct
+        ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+    """, (
+        game_date, total, correct, total - correct, accuracy,
+        hit_pred, hit_correct, no_hit_pred, no_hit_correct,
+    ))
+    db.commit()
+
+    return summary
+
+
+# ── Reporting ────────────────────────────────────────────────────────
+
+
+def get_overall_stats() -> dict[str, Any]:
+    """Get lifetime prediction accuracy stats."""
+    with contextlib.closing(_get_db()) as db:
+        row = db.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN (prediction = 'HIT' AND got_hit = 1) OR (prediction = 'NO HIT' AND got_hit = 0) THEN 1 ELSE 0 END) as correct,
+                SUM(CASE WHEN prediction = 'HIT' THEN 1 ELSE 0 END) as hit_preds,
+                SUM(CASE WHEN prediction = 'HIT' AND got_hit = 1 THEN 1 ELSE 0 END) as hit_correct,
+                SUM(CASE WHEN prediction = 'NO HIT' THEN 1 ELSE 0 END) as no_hit_preds,
+                SUM(CASE WHEN prediction = 'NO HIT' AND got_hit = 0 THEN 1 ELSE 0 END) as no_hit_correct
+            FROM predictions
+            WHERE actual_result IS NOT NULL AND actual_result != 'DNP'
+        """).fetchone()
+
+        total = row["total"] or 0
+        correct = row["correct"] or 0
+        hit_preds = row["hit_preds"] or 0
+        hit_correct = row["hit_correct"] or 0
+        no_hit_preds = row["no_hit_preds"] or 0
+        no_hit_correct = row["no_hit_correct"] or 0
+
+        pending = db.execute(
+            "SELECT COUNT(*) as c FROM predictions WHERE actual_result IS NULL"
+        ).fetchone()["c"]
+
+        conf_stats = {}
+        for conf in ["high", "medium", "low", "insufficient"]:
+            crow = db.execute("""
+                SELECT COUNT(*) as total,
+                    SUM(CASE WHEN (prediction = 'HIT' AND got_hit = 1) OR (prediction = 'NO HIT' AND got_hit = 0) THEN 1 ELSE 0 END) as correct
+                FROM predictions
+                WHERE confidence = ? AND actual_result IS NOT NULL AND actual_result != 'DNP'
+            """, (conf,)).fetchone()
+            ct = crow["total"] or 0
+            cc = crow["correct"] or 0
+            conf_stats[conf] = {"total": ct, "correct": cc, "accuracy": round(cc / ct * 100, 1) if ct > 0 else 0}
+
+    return {
+        "total_predictions": total,
+        "correct": correct,
+        "accuracy": round(correct / total * 100, 1) if total > 0 else 0,
+        "pending": pending,
+        "hit_predictions": {"total": hit_preds, "correct": hit_correct,
+                            "accuracy": round(hit_correct / hit_preds * 100, 1) if hit_preds > 0 else 0},
+        "no_hit_predictions": {"total": no_hit_preds, "correct": no_hit_correct,
+                               "accuracy": round(no_hit_correct / no_hit_preds * 100, 1) if no_hit_preds > 0 else 0},
+        "by_confidence": conf_stats,
+    }
+
+
+def get_tier_stats(game_date: str | None = None) -> list[dict]:
+    """Get hit rate by probability tier, optionally for a specific date."""
+    with contextlib.closing(_get_db()) as db:
+        date_filter = "AND game_date = ?" if game_date else ""
+        params = (game_date,) if game_date else ()
+        rows = db.execute(f"""
+            SELECT
+                CASE
+                    WHEN hit_probability >= {TIER_STRONG} THEN 'STRONG HIT'
+                    WHEN hit_probability >= {TIER_LEAN} THEN 'LEAN HIT'
+                    WHEN hit_probability >= {TIER_TOSSUP} THEN 'TOSS-UP'
+                    ELSE 'FADE'
+                END as tier,
+                COUNT(*) as total,
+                SUM(got_hit) as hits,
+                ROUND(AVG(got_hit) * 100, 1) as hit_rate
+            FROM predictions
+            WHERE actual_result IS NOT NULL AND actual_result != 'DNP' {date_filter}
+            GROUP BY tier
+            ORDER BY hit_rate DESC
+        """, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recent_predictions(limit: int = 20) -> list[dict]:
+    """Get most recent predictions with results."""
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute("""
+            SELECT * FROM predictions ORDER BY created_at DESC LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Book odds storage ────────────────────────────────────────────
+
+
+def save_book_odds(
+    game_pk: int, game_date: str, batter_name: str, batter_id: int,
+    model_prob: float, odds_entries: list[dict],
+) -> None:
+    """Save book odds for a batter. One row per book."""
+    with contextlib.closing(_get_db()) as db:
+        for entry in odds_entries:
+            over = entry.get("over")
+            if over is None:
+                continue
+            implied = american_to_prob(over)
+            edge = model_prob - implied
+
+            db.execute("""
+                INSERT INTO book_odds (
+                    game_pk, game_date, batter_name, batter_id,
+                    book, line, over_price, under_price,
+                    implied_prob, model_prob, edge
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                game_pk, game_date, batter_name, batter_id,
+                entry.get("book", "unknown"), entry.get("line", 0.5),
+                over, entry.get("under"),
+                round(implied, 4), round(model_prob, 4), round(edge, 4),
+            ))
+        db.commit()
+
+
+def get_odds_for_date(game_date: str) -> list[dict]:
+    """Get all saved odds for a date."""
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute("""
+            SELECT * FROM book_odds WHERE game_date = ? ORDER BY edge DESC
+        """, (game_date,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def games_with_odds(game_date: str) -> set[int]:
+    """Get game_pks that already have odds fetched for a date."""
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute(
+            "SELECT DISTINCT game_pk FROM book_odds WHERE game_date = ?",
+            (game_date,)
+        ).fetchall()
+    return {r["game_pk"] for r in rows}
+
+
+# ── Paper betting ────────────────────────────────────────────────
+
+
+def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
+    """Pick the top +EV bets for a date from stored odds and predictions.
+
+    Selects the best edge bets: model_prob >= 0.64, edge > 0.02,
+    ranked by edge. Saves to paper_bets table. Returns the placed bets.
+
+    Thresholds tuned on 1,113 batter-game odds entries (Apr 5 - May 1):
+      prob >= 64%, edge > 2% -> 68.7% win rate, +10.9% ROI
+    """
+    with contextlib.closing(_get_db()) as db:
+        existing = db.execute(
+            "SELECT COUNT(*) as c FROM paper_bets WHERE game_date = ?",
+            (game_date,)
+        ).fetchone()["c"]
+        if existing > 0:
+            return []
+
+        rows = db.execute("""
+            SELECT bo.*, p.prediction, p.confidence, p.edge as pred_edge, p.pitcher_name
+            FROM book_odds bo
+            JOIN predictions p ON bo.game_pk = p.game_pk AND bo.batter_name = p.batter_name
+            WHERE bo.game_date = ?
+              AND bo.line = 0.5
+              AND bo.model_prob >= 0.64
+              AND bo.edge > 0.02
+              AND p.prediction = 'HIT'
+            ORDER BY bo.edge DESC
+        """, (game_date,)).fetchall()
+
+        if not rows:
+            return []
+
+        seen = set()
+        candidates = []
+        for r in rows:
+            if r["batter_name"] not in seen:
+                seen.add(r["batter_name"])
+                candidates.append(dict(r))
+
+        bets = candidates[:max_bets]
+
+        for bet in bets:
+            odds = bet["over_price"]
+            db.execute("""
+                INSERT INTO paper_bets (
+                    game_pk, game_date, batter_name, batter_id,
+                    pitcher_name, model_prob, confidence, edge_tags,
+                    book, book_odds, implied_prob, edge, stake
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 100)
+            """, (
+                bet["game_pk"], game_date, bet["batter_name"], bet["batter_id"],
+                bet.get("pitcher_name", ""), bet["model_prob"],
+                bet.get("confidence", ""), bet.get("pred_edge", ""),
+                bet["book"], odds, bet["implied_prob"], bet["edge"],
+            ))
+
+        db.commit()
+    return bets
+
+
+def settle_paper_bets(game_date: str = None) -> dict[str, Any]:
+    """Settle all unsettled paper bets that have results.
+
+    If game_date is given, only settles that date.
+    Otherwise settles ALL unsettled bets with available results.
+    """
+    with contextlib.closing(_get_db()) as db:
+        if game_date:
+            date_filter = "AND pb.game_date = ?"
+            params = (game_date,)
+        else:
+            date_filter = ""
+            params = ()
+
+        unsettled = db.execute(f"""
+            SELECT pb.id, pb.batter_name, pb.game_pk, pb.game_date, pb.book_odds, pb.stake,
+                   (SELECT p.got_hit FROM predictions p
+                    WHERE p.game_pk = pb.game_pk AND p.batter_name = pb.batter_name
+                      AND p.got_hit IS NOT NULL
+                    LIMIT 1) as got_hit
+            FROM paper_bets pb
+            WHERE pb.settled = 0 {date_filter}
+        """, params).fetchall()
+
+        if not unsettled:
+            return {"date": game_date, "settled": 0}
+
+        total_pnl = 0.0
+        wins = 0
+        losses = 0
+        settled = 0
+
+        for bet in unsettled:
+            got_hit = bet["got_hit"]
+            if got_hit is None:
+                continue
+
+            odds = bet["book_odds"]
+            stake = bet["stake"]
+
+            if got_hit == 1:
+                if odds < 0:
+                    pnl = stake * (100 / abs(odds))
+                else:
+                    pnl = stake * (odds / 100)
+                wins += 1
+            else:
+                pnl = -stake
+                losses += 1
+
+            pnl = round(pnl, 2)
+            total_pnl += pnl
+
+            db.execute("""
+                UPDATE paper_bets SET
+                    result = ?, got_hit = ?, pnl = ?, settled = 1
+                WHERE id = ?
+            """, (
+                "WIN" if got_hit == 1 else "LOSS",
+                got_hit, pnl, bet["id"],
+            ))
+            settled += 1
+
+        db.commit()
+
+    return {
+        "date": game_date or "all",
+        "settled": settled,
+        "wins": wins,
+        "losses": losses,
+        "pnl": round(total_pnl, 2),
+    }
+
+
+def get_paper_summary() -> dict[str, Any]:
+    """Get overall paper betting performance."""
+    with contextlib.closing(_get_db()) as db:
+        row = db.execute("""
+            SELECT
+                COUNT(*) as total_bets,
+                SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) as losses,
+                SUM(pnl) as total_pnl,
+                SUM(stake) as total_staked,
+                COUNT(DISTINCT game_date) as days
+            FROM paper_bets WHERE settled = 1
+        """).fetchone()
+
+        total = row["total_bets"] or 0
+        wins = row["wins"] or 0
+        losses = row["losses"] or 0
+        pnl = row["total_pnl"] or 0.0
+        staked = row["total_staked"] or 0.0
+        days = row["days"] or 0
+
+        pending = db.execute(
+            "SELECT COUNT(*) as c FROM paper_bets WHERE settled = 0"
+        ).fetchone()["c"]
+
+        daily = db.execute("""
+            SELECT game_date,
+                COUNT(*) as bets,
+                SUM(CASE WHEN result = 'WIN' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN result = 'LOSS' THEN 1 ELSE 0 END) as losses,
+                SUM(pnl) as pnl
+            FROM paper_bets WHERE settled = 1
+            GROUP BY game_date ORDER BY game_date
+        """).fetchall()
+
+    return {
+        "total_bets": total,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
+        "total_pnl": round(pnl, 2),
+        "roi": round(pnl / staked * 100, 1) if staked > 0 else 0,
+        "pending": pending,
+        "days": days,
+        "avg_daily_pnl": round(pnl / days, 2) if days > 0 else 0,
+        "daily": [dict(d) for d in daily],
+    }
+
+
+def get_paper_bets_for_date(game_date: str) -> list[dict]:
+    """Get all paper bets for a specific date."""
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute("""
+            SELECT * FROM paper_bets WHERE game_date = ? ORDER BY edge DESC
+        """, (game_date,)).fetchall()
+    return [dict(r) for r in rows]
