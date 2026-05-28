@@ -11,6 +11,7 @@ MLB API lineup endpoint:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date
 from dataclasses import dataclass, field
 
@@ -21,6 +22,8 @@ logger = logging.getLogger("baseball_bot.lineup")
 # Module-level cache for player bio data (handedness, etc.)
 _player_bios: dict[int, dict] = {}
 _player_bios_loaded: bool = False
+_player_bios_loaded_at: float = 0.0
+_BIOS_TTL_SECONDS: int = 24 * 60 * 60  # refresh every 24 hours
 
 
 @dataclass
@@ -46,6 +49,7 @@ class GameLineup:
     home_pitcher_throws: str | None
     away_lineup: list[PlayerInfo] = field(default_factory=list)
     home_lineup: list[PlayerInfo] = field(default_factory=list)
+    officials: list[dict] = field(default_factory=list)  # raw officials data from API
 
     @property
     def lineups_posted(self) -> bool:
@@ -62,9 +66,11 @@ async def _load_player_bios() -> None:
 
     Caches ID -> {bats, throws, fullName} for the session.
     Replaces ~270 individual API calls with 1.
+    Refreshes automatically every 24 hours to pick up callups,
+    trades, and roster moves.
     """
-    global _player_bios_loaded
-    if _player_bios_loaded:
+    global _player_bios_loaded, _player_bios_loaded_at
+    if _player_bios_loaded and (time.time() - _player_bios_loaded_at) < _BIOS_TTL_SECONDS:
         return
 
     try:
@@ -79,6 +85,7 @@ async def _load_player_bios() -> None:
                 "fullName": p.get("fullName", ""),
             }
         _player_bios_loaded = True
+        _player_bios_loaded_at = time.time()
         logger.info(f"Cached {len(_player_bios)} player bios")
     except Exception as e:
         logger.error(f"Failed to load player bios: {e}")
@@ -141,7 +148,7 @@ async def get_todays_games(game_date: str | None = None) -> list[GameLineup]:
     try:
         data = await fetch_json(
             f"{MLB_API}/schedule?date={target_date}&sportId=1"
-            f"&hydrate=probablePitcher,lineups,venue"
+            f"&hydrate=probablePitcher,lineups,venue,officials"
         )
     except Exception as e:
         logger.error(f"Failed to fetch schedule: {e}")
@@ -187,6 +194,7 @@ async def get_todays_games(game_date: str | None = None) -> list[GameLineup]:
             home_pitcher_throws=home_throws,
             away_lineup=away_lineup,
             home_lineup=home_lineup,
+            officials=game.get("officials", []),
         ))
 
     logger.info(f"Found {len(games)} games for {target_date}, "

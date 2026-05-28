@@ -14,9 +14,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
-
-from config import MLB_API, TIER_STRONG, TIER_LEAN, TIER_TOSSUP, american_to_prob
+from config import MLB_API, MODEL_VERSION, TIER_STRONG, TIER_LEAN, TIER_TOSSUP, american_to_prob, fetch_json
 from predictor import HitPrediction
 
 logger = logging.getLogger("baseball_bot.tracker")
@@ -48,10 +46,16 @@ def _init_tables(db: sqlite3.Connection) -> None:
             got_hit INTEGER DEFAULT NULL,
             at_bats INTEGER DEFAULT NULL,
             hits INTEGER DEFAULT NULL,
+            factors_json TEXT DEFAULT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(game_pk, batter_id)
         )
     """)
+    for col, typ in [("factors_json", "TEXT"), ("model_version", "TEXT")]:
+        try:
+            db.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ} DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass
     db.execute("""
         CREATE TABLE IF NOT EXISTS book_odds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,9 +70,18 @@ def _init_tables(db: sqlite3.Connection) -> None:
             implied_prob REAL,
             model_prob REAL,
             edge REAL,
+            closing_over_price INTEGER DEFAULT NULL,
+            closing_implied_prob REAL DEFAULT NULL,
+            clv REAL DEFAULT NULL,
             fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Add CLV columns to existing databases
+    for col, typ in [("closing_over_price", "INTEGER"), ("closing_implied_prob", "REAL"), ("clv", "REAL")]:
+        try:
+            db.execute(f"ALTER TABLE book_odds ADD COLUMN {col} {typ} DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     db.execute("""
         CREATE TABLE IF NOT EXISTS daily_summary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,27 +134,47 @@ def _get_db() -> sqlite3.Connection:
 
 
 def save_predictions(preds: list[HitPrediction]) -> None:
-    """Save multiple predictions. Duplicates (same game + batter) are updated."""
+    """Save predictions. Skips any that are already settled (have results).
+
+    Uses INSERT OR IGNORE for predictions that already exist, then
+    updates only unsettled ones. This prevents re-analysis from
+    clobbering settled predictions that already have got_hit data.
+    """
+    import json
+    from dataclasses import asdict
+
     with contextlib.closing(_get_db()) as db:
-        db.executemany("""
-            INSERT OR REPLACE INTO predictions (
-                game_pk, game_date, batter_name, batter_id,
-                pitcher_name, pitcher_id, venue,
-                prediction, hit_probability, confidence, edge
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            (p.game_pk, p.game_date, p.batter_name, p.batter_id,
-             p.pitcher_name, p.pitcher_id, p.venue,
-             p.prediction, p.hit_probability, p.confidence, p.edge)
-            for p in preds
-        ])
+        for p in preds:
+            # Check if a settled prediction already exists for this matchup
+            existing = db.execute(
+                "SELECT id, got_hit FROM predictions WHERE game_pk = ? AND batter_id = ?",
+                (p.game_pk, p.batter_id),
+            ).fetchone()
+
+            if existing and existing["got_hit"] is not None:
+                # Already settled — don't overwrite
+                continue
+
+            db.execute("""
+                INSERT OR REPLACE INTO predictions (
+                    game_pk, game_date, batter_name, batter_id,
+                    pitcher_name, pitcher_id, venue,
+                    prediction, hit_probability, confidence, edge, factors_json,
+                    model_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                p.game_pk, p.game_date, p.batter_name, p.batter_id,
+                p.pitcher_name, p.pitcher_id, p.venue,
+                p.prediction, p.hit_probability, p.confidence, p.edge,
+                json.dumps(asdict(p.factors)), MODEL_VERSION,
+            ))
         db.commit()
 
 
 # ── Results checker ──────────────────────────────────────────────────
 
 
-def check_results(game_date: str = None) -> dict[str, Any]:
+async def check_results(game_date: str = None) -> dict[str, Any]:
     """Check actual results for a date's predictions.
 
     Pulls box scores from MLB API and updates the database.
@@ -163,7 +196,7 @@ def check_results(game_date: str = None) -> dict[str, Any]:
 
         for gpk in game_pks:
             try:
-                box = _fetch_boxscore(gpk)
+                box = await _fetch_boxscore(gpk)
                 if box:
                     results_map[gpk] = box
             except Exception as e:
@@ -209,12 +242,10 @@ def check_results(game_date: str = None) -> dict[str, Any]:
     return {"date": game_date, "checked": updated, "summary": summary}
 
 
-def _fetch_boxscore(game_pk: int) -> dict[int, dict] | None:
+async def _fetch_boxscore(game_pk: int) -> dict[int, dict] | None:
     """Fetch box score and return batter_id -> hitting stats."""
     try:
-        r = httpx.get(f"{MLB_API}/game/{game_pk}/boxscore", timeout=15)
-        r.raise_for_status()
-        data = r.json()
+        data = await fetch_json(f"{MLB_API}/game/{game_pk}/boxscore")
     except Exception as e:
         logger.warning(f"Failed to fetch boxscore for game {game_pk}: {e}")
         return None
@@ -379,6 +410,44 @@ def get_tier_stats(game_date: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_calibration_scores(game_date: str | None = None) -> dict[str, Any]:
+    """Compute Brier score and log loss for model calibration.
+
+    Brier score: mean squared error between predicted prob and outcome (lower is better).
+    Log loss: mean negative log-likelihood (lower is better, penalizes confident wrong predictions).
+    """
+    import math
+
+    with contextlib.closing(_get_db()) as db:
+        date_filter = "AND game_date = ?" if game_date else ""
+        params = (game_date,) if game_date else ()
+        rows = db.execute(f"""
+            SELECT hit_probability, got_hit FROM predictions
+            WHERE actual_result IS NOT NULL AND actual_result != 'DNP'
+              AND got_hit IS NOT NULL {date_filter}
+        """, params).fetchall()
+
+    if not rows:
+        return {"total": 0}
+
+    n = len(rows)
+    brier_sum = 0.0
+    log_loss_sum = 0.0
+    eps = 1e-15  # avoid log(0)
+
+    for r in rows:
+        p = max(eps, min(1 - eps, r["hit_probability"]))
+        y = r["got_hit"]
+        brier_sum += (p - y) ** 2
+        log_loss_sum += -(y * math.log(p) + (1 - y) * math.log(1 - p))
+
+    return {
+        "total": n,
+        "brier_score": round(brier_sum / n, 4),
+        "log_loss": round(log_loss_sum / n, 4),
+    }
+
+
 def get_recent_predictions(limit: int = 20) -> list[dict]:
     """Get most recent predictions with results."""
     with contextlib.closing(_get_db()) as db:
@@ -417,6 +486,96 @@ def save_book_odds(
                 round(implied, 4), round(model_prob, 4), round(edge, 4),
             ))
         db.commit()
+
+
+def update_closing_odds(
+    game_pk: int, game_date: str, batter_name: str,
+    book: str, closing_over: int,
+) -> None:
+    """Update a book_odds row with closing line and compute CLV."""
+    closing_implied = american_to_prob(closing_over)
+    with contextlib.closing(_get_db()) as db:
+        # Find the matching opening odds row
+        row = db.execute("""
+            SELECT id, implied_prob FROM book_odds
+            WHERE game_pk = ? AND batter_name = ? AND book = ?
+              AND line = 0.5 AND closing_over_price IS NULL
+            ORDER BY edge DESC LIMIT 1
+        """, (game_pk, batter_name, book)).fetchone()
+        if row:
+            clv = closing_implied - row["implied_prob"]  # positive = line moved our way (we got value)
+            db.execute("""
+                UPDATE book_odds SET
+                    closing_over_price = ?,
+                    closing_implied_prob = ?,
+                    clv = ?
+                WHERE id = ?
+            """, (closing_over, round(closing_implied, 4), round(clv, 4), row["id"]))
+            db.commit()
+
+
+def games_needing_closing_odds(game_date: str) -> set[int]:
+    """Get game_pks that have opening odds but no closing odds yet, and have 64%+ model prob."""
+    with contextlib.closing(_get_db()) as db:
+        rows = db.execute("""
+            SELECT DISTINCT game_pk FROM book_odds
+            WHERE game_date = ? AND line = 0.5
+              AND model_prob >= 0.64
+              AND closing_over_price IS NULL
+        """, (game_date,)).fetchall()
+    return {r["game_pk"] for r in rows}
+
+
+def get_clv_stats(game_date: str | None = None) -> dict[str, Any]:
+    """Get CLV statistics, optionally filtered to a date."""
+    with contextlib.closing(_get_db()) as db:
+        date_filter = "AND game_date = ?" if game_date else ""
+        params = (game_date,) if game_date else ()
+
+        row = db.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN clv > 0 THEN 1 ELSE 0 END) as positive,
+                AVG(clv) as avg_clv,
+                MIN(clv) as min_clv,
+                MAX(clv) as max_clv
+            FROM book_odds
+            WHERE clv IS NOT NULL AND line = 0.5 {date_filter}
+        """, params).fetchone()
+
+        total = row["total"] or 0
+        if total == 0:
+            return {"total": 0, "message": "No CLV data yet"}
+
+        positive = row["positive"] or 0
+        avg_clv = row["avg_clv"] or 0
+
+        # CLV by tier
+        tier_clv = db.execute(f"""
+            SELECT
+                CASE
+                    WHEN model_prob >= 0.70 THEN 'STRONG HIT'
+                    WHEN model_prob >= 0.62 THEN 'LEAN HIT'
+                    WHEN model_prob >= 0.55 THEN 'TOSS-UP'
+                    ELSE 'FADE'
+                END as tier,
+                COUNT(*) as n,
+                AVG(clv) as avg_clv,
+                SUM(CASE WHEN clv > 0 THEN 1 ELSE 0 END) as positive
+            FROM book_odds
+            WHERE clv IS NOT NULL AND line = 0.5 {date_filter}
+            GROUP BY tier ORDER BY avg_clv DESC
+        """, params).fetchall()
+
+    return {
+        "total": total,
+        "positive": positive,
+        "positive_pct": round(positive / total * 100, 1),
+        "avg_clv": round(avg_clv * 100, 2),  # as percentage
+        "min_clv": round((row["min_clv"] or 0) * 100, 2),
+        "max_clv": round((row["max_clv"] or 0) * 100, 2),
+        "by_tier": [dict(r) for r in tier_clv],
+    }
 
 
 def get_odds_for_date(game_date: str) -> list[dict]:

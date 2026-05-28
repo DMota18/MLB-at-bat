@@ -10,8 +10,8 @@ echo "=== Deploying Baseball Bot ==="
 echo "[1/4] Uploading files..."
 scp -i "$KEY" \
     config.py bot.py predictor.py tracker.py matchup_data.py \
-    data_fetchers.py formatters.py \
-    lineup_detector.py odds_api.py \
+    data_fetchers.py formatters.py weather.py umpire.py \
+    lineup_detector.py odds_api.py drift.py ab_testing.py predictor_shadow.py predictor_v4.py \
     requirements.txt baseball-bot.service .env.example \
     "$SERVER:$REMOTE_DIR/"
 

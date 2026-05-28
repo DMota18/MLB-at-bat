@@ -87,10 +87,11 @@ def test_save_predictions_empty_list():
 # ── check_results ───────────────────────────────────────────────────
 
 
-def test_check_results_no_pending():
+@pytest.mark.asyncio
+async def test_check_results_no_pending():
     from tracker import check_results
 
-    result = check_results("2026-05-01")
+    result = await check_results("2026-05-01")
     assert result["checked"] == 0
     assert "No pending" in result["message"]
 
@@ -480,3 +481,84 @@ def test_settle_positive_odds_payout():
     result = settle_paper_bets("2026-05-01")
     # +110 odds: win = 100 * (110/100) = 110
     assert result["pnl"] == pytest.approx(110.0, abs=0.1)
+
+
+# ── CLV tracking ────────────────────────────────────────────────────
+
+
+def test_update_closing_odds_positive_clv():
+    """When closing line moves toward our position, CLV is positive."""
+    from tracker import save_book_odds, update_closing_odds, _get_db
+
+    # Opening: -170 (implied 63%)
+    save_book_odds(717001, "2026-05-01", "Judge", 1, 0.72,
+                   [{"book": "DK", "over": -170, "under": 130, "line": 0.5}])
+
+    # Closing: -200 (implied 67%) — line moved our way
+    update_closing_odds(717001, "2026-05-01", "Judge", "DK", -200)
+
+    db = _get_db()
+    row = db.execute("SELECT * FROM book_odds WHERE batter_name = 'Judge'").fetchone()
+    db.close()
+    assert row["closing_over_price"] == -200
+    assert row["closing_implied_prob"] == pytest.approx(0.6667, abs=0.01)
+    # Opening: -170 implied = 0.6296, Closing: -200 implied = 0.6667
+    # CLV = closing - opening = 0.6667 - 0.6296 = +0.037 (positive = we got value)
+    assert row["clv"] == pytest.approx(0.037, abs=0.01)
+
+
+def test_update_closing_odds_negative_clv():
+    """When closing line moves against us, CLV is negative."""
+    from tracker import save_book_odds, update_closing_odds, _get_db
+
+    # Opening: -170 (implied 63%)
+    save_book_odds(717001, "2026-05-01", "Soto", 2, 0.70,
+                   [{"book": "BetMGM", "over": -170, "under": 130, "line": 0.5}])
+
+    # Closing: -140 (implied 58%) — line moved against us (got cheaper)
+    update_closing_odds(717001, "2026-05-01", "Soto", "BetMGM", -140)
+
+    db = _get_db()
+    row = db.execute("SELECT * FROM book_odds WHERE batter_name = 'Soto'").fetchone()
+    db.close()
+    assert row["closing_over_price"] == -140
+    # CLV = closing 0.5833 - opening 0.6296 = -0.046 (negative = line moved against us)
+    assert row["clv"] == pytest.approx(-0.046, abs=0.01)
+
+
+def test_get_clv_stats_empty():
+    from tracker import get_clv_stats
+
+    stats = get_clv_stats()
+    assert stats["total"] == 0
+
+
+def test_get_clv_stats_with_data():
+    from tracker import save_book_odds, update_closing_odds, get_clv_stats
+
+    save_book_odds(717001, "2026-05-01", "Judge", 1, 0.72,
+                   [{"book": "DK", "over": -170, "under": 130, "line": 0.5}])
+    save_book_odds(717002, "2026-05-01", "Soto", 2, 0.70,
+                   [{"book": "DK", "over": -180, "under": 140, "line": 0.5}])
+
+    update_closing_odds(717001, "2026-05-01", "Judge", "DK", -200)
+    update_closing_odds(717002, "2026-05-01", "Soto", "DK", -150)
+
+    stats = get_clv_stats()
+    assert stats["total"] == 2
+    assert "avg_clv" in stats
+    assert "by_tier" in stats
+
+
+def test_games_needing_closing_odds():
+    from tracker import save_book_odds, games_needing_closing_odds
+
+    save_book_odds(717001, "2026-05-01", "Judge", 1, 0.72,
+                   [{"book": "DK", "over": -170, "under": 130, "line": 0.5}])
+    save_book_odds(717002, "2026-05-01", "Weak", 2, 0.50,
+                   [{"book": "DK", "over": +120, "under": -140, "line": 0.5}])
+
+    # Only game with 64%+ model prob should be returned
+    needs = games_needing_closing_odds("2026-05-01")
+    assert 717001 in needs
+    assert 717002 not in needs

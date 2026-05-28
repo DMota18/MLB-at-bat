@@ -29,13 +29,20 @@ from tracker import (
     save_predictions, check_results, get_overall_stats, get_recent_predictions,
     save_book_odds, get_odds_for_date, games_with_odds,
     place_paper_bets, settle_paper_bets, get_paper_summary, get_paper_bets_for_date,
-    get_tier_stats,
+    get_tier_stats, update_closing_odds, games_needing_closing_odds, get_clv_stats,
+    get_calibration_scores,
 )
 from matchup_data import (
     get_h2h, get_pitcher_arsenal, get_batter_vs_pitch_types, compute_arsenal_matchup,
     get_pitcher_recent_starts, get_batter_statcast,
 )
 from odds_api import get_events, get_hit_props, find_best_odds, match_event_to_game
+from drift import check_drift, format_drift_report
+from ab_testing import (
+    compare_models, format_ab_report, settle_shadow_predictions,
+    get_shadow_model, run_shadow_prediction, register_shadow_model,
+)
+from predictor_v4 import predict_hit_v4
 
 load_dotenv()
 
@@ -50,8 +57,37 @@ logger = logging.getLogger("baseball_bot")
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = int(os.environ["TELEGRAM_CHAT_ID"])
 
-_analyzed_games: set[int] = set()
+# ── Register shadow model for A/B testing ────────────────────────────
+register_shadow_model(
+    name="v4-kbb-xba-isotonic",
+    version="v4.0-shadow",
+    predict_fn=predict_hit_v4,
+    description="K%/BB% factors, xBA blend, isotonic calibration, reduced platoon (1.02/0.98)",
+)
+
 _todays_games: list[GameLineup] = []
+
+
+# ── Persistent analyzed games tracking ────────────────────────────────
+
+def _load_analyzed_games() -> set[int]:
+    """Load today's analyzed game_pks from the predictions DB."""
+    from tracker import _get_db
+    import contextlib
+    from datetime import date
+    today = date.today().isoformat()
+    try:
+        with contextlib.closing(_get_db()) as db:
+            rows = db.execute(
+                "SELECT DISTINCT game_pk FROM predictions WHERE game_date = ?",
+                (today,),
+            ).fetchall()
+        return {r["game_pk"] for r in rows}
+    except Exception:
+        return set()
+
+
+_analyzed_games: set[int] = _load_analyzed_games()
 
 
 def authorized(func):
@@ -67,6 +103,52 @@ def authorized(func):
 
 
 
+# ── Game state helpers ────────────────────────────────────────────────
+
+
+def _void_predictions(game_pk: int) -> None:
+    """Mark predictions for a postponed/cancelled game as DNP."""
+    import contextlib
+    from tracker import _get_db
+    try:
+        with contextlib.closing(_get_db()) as db:
+            updated = db.execute(
+                "UPDATE predictions SET actual_result = 'DNP' WHERE game_pk = ? AND actual_result IS NULL",
+                (game_pk,),
+            ).rowcount
+            db.commit()
+        if updated > 0:
+            logger.info(f"Voided {updated} predictions for postponed game {game_pk}")
+    except Exception as e:
+        logger.error(f"Failed to void predictions for {game_pk}: {e}")
+
+
+# Track starting pitchers at analysis time to detect scratches
+_game_pitchers: dict[int, tuple[str | None, str | None]] = {}
+
+
+def _check_pitcher_scratch(game: 'GameLineup') -> bool:
+    """Check if a pitcher was scratched since we last analyzed this game.
+
+    Returns True if a scratch was detected (game should be re-analyzed).
+    """
+    if game.game_pk not in _game_pitchers:
+        return False
+
+    prev_away, prev_home = _game_pitchers[game.game_pk]
+    current_away = game.away_pitcher
+    current_home = game.home_pitcher
+
+    if prev_away and current_away and prev_away != current_away:
+        logger.info(f"Pitcher scratch detected: {prev_away} -> {current_away} ({game.away_team})")
+        return True
+    if prev_home and current_home and prev_home != current_home:
+        logger.info(f"Pitcher scratch detected: {prev_home} -> {current_home} ({game.home_team})")
+        return True
+
+    return False
+
+
 # ── Lineup polling ───────────────────────────────────────────────────
 
 
@@ -75,8 +157,22 @@ async def check_lineups(bot) -> None:
     games = await get_todays_games()
 
     for game in games:
-        if game.game_pk in _analyzed_games:
+        # Handle postponements and suspensions
+        if game.status in ("Postponed", "Suspended", "Cancelled"):
+            if game.game_pk in _analyzed_games:
+                logger.info(f"Game {game.away_team}@{game.home_team} {game.status} — voiding predictions")
+                _void_predictions(game.game_pk)
+            _analyzed_games.add(game.game_pk)
             continue
+
+        if game.game_pk in _analyzed_games:
+            # Check for pitcher scratch on already-analyzed games
+            if game.lineups_posted and _check_pitcher_scratch(game):
+                logger.info(f"Re-analyzing {game.away_team}@{game.home_team} due to pitcher scratch")
+                _analyzed_games.discard(game.game_pk)
+                # Fall through to re-analyze
+            else:
+                continue
         if not game.lineups_posted:
             continue
         if game.status in ("Final", "Game Over", "In Progress"):
@@ -97,6 +193,7 @@ async def check_lineups(bot) -> None:
                 card = card[len(chunk):]
 
             _analyzed_games.add(game.game_pk)
+            _game_pitchers[game.game_pk] = (game.away_pitcher, game.home_pitcher)
         except Exception as e:
             logger.error(f"Card failed: {e}", exc_info=True)
 
@@ -119,7 +216,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/stats - Prediction accuracy\n"
         "/recent - Recent predictions\n"
         "/player <name> - Player lookup\n"
-        "/park - Park factors"
+        "/park - Park factors\n"
+        "/drift - Model calibration health\n"
+        "/ab [days] - A/B test results"
     )
 
 
@@ -349,7 +448,7 @@ async def cmd_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Check yesterday by default, or a specific date
     target = " ".join(context.args) if context.args else None
-    result = check_results(target)
+    result = await check_results(target)
     summary = result.get("summary", {})
 
     if summary.get("total", 0) == 0:
@@ -407,6 +506,25 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         emoji = "\U0001f4b0" if ps["total_pnl"] >= 0 else "\U0001f4c9"
         lines.append(f"{emoji} Paper bets: {ps['wins']}W-{ps['losses']}L ({ps['win_rate']}%) | ${ps['total_pnl']:+.2f} ROI: {ps['roi']:+.1f}%")
 
+    # CLV stats
+    clv = get_clv_stats()
+    if clv["total"] > 0:
+        lines.append("")
+        clv_emoji = "\U0001f4c8" if clv["avg_clv"] > 0 else "\U0001f4c9"
+        lines.append(f"{clv_emoji} CLV: {clv['avg_clv']:+.2f}% avg | {clv['positive_pct']}% positive ({clv['positive']}/{clv['total']})")
+        for t in clv["by_tier"]:
+            avg = (t["avg_clv"] or 0) * 100
+            pos = t["positive"] or 0
+            n = t["n"] or 0
+            if n > 0:
+                lines.append(f"  {t['tier']:15s}: {avg:+.2f}% avg CLV ({pos}/{n} positive)")
+
+    # Calibration scores
+    cal = get_calibration_scores()
+    if cal["total"] > 0:
+        lines.append("")
+        lines.append(f"\U0001f4cf Calibration: Brier={cal['brier_score']:.4f} | LogLoss={cal['log_loss']:.4f} ({cal['total']} preds)")
+
     await update.message.reply_text("\n".join(lines))
 
 
@@ -436,6 +554,54 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @authorized
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show bot health status."""
+    import psutil
+    import time as _time
+
+    lines = ["\U0001f3e5 Bot Health\n"]
+
+    # Uptime
+    try:
+        proc = psutil.Process()
+        uptime_secs = _time.time() - proc.create_time()
+        hours = int(uptime_secs // 3600)
+        mins = int((uptime_secs % 3600) // 60)
+        lines.append(f"Uptime: {hours}h {mins}m")
+    except Exception:
+        lines.append("Uptime: unknown")
+
+    # Database stats
+    from tracker import _get_db
+    import contextlib
+    with contextlib.closing(_get_db()) as tdb:
+        today = date.today().isoformat()
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+        preds_today = tdb.execute("SELECT COUNT(*) as c FROM predictions WHERE game_date = ?", (today,)).fetchone()["c"]
+        preds_pending = tdb.execute("SELECT COUNT(*) as c FROM predictions WHERE actual_result IS NULL").fetchone()["c"]
+        bets_today = tdb.execute("SELECT COUNT(*) as c FROM paper_bets WHERE game_date = ?", (today,)).fetchone()["c"]
+        clv_today = tdb.execute("SELECT COUNT(*) as c FROM book_odds WHERE game_date = ? AND clv IS NOT NULL", (today,)).fetchone()["c"]
+        odds_today = tdb.execute("SELECT COUNT(*) as c FROM book_odds WHERE game_date = ?", (today,)).fetchone()["c"]
+
+        # Last activity timestamps
+        last_pred = tdb.execute("SELECT MAX(created_at) as t FROM predictions").fetchone()["t"] or "never"
+        last_odds = tdb.execute("SELECT MAX(fetched_at) as t FROM book_odds").fetchone()["t"] or "never"
+
+    lines.append(f"\nToday ({today}):")
+    lines.append(f"  Predictions: {preds_today}")
+    lines.append(f"  Odds entries: {odds_today}")
+    lines.append(f"  CLV entries: {clv_today}")
+    lines.append(f"  Paper bets: {bets_today}")
+    lines.append(f"  Pending settlement: {preds_pending}")
+    lines.append(f"\nLast prediction: {last_pred}")
+    lines.append(f"Last odds fetch: {last_odds}")
+    lines.append(f"Analyzed games: {len(_analyzed_games)}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@authorized
 async def cmd_park(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = " ".join(context.args) if context.args else None
     if not name:
@@ -458,7 +624,7 @@ async def cmd_park(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def auto_check_results(bot) -> None:
     """Auto-check yesterday's results and send summary."""
     logger.info("Auto-checking yesterday's results...")
-    result = check_results()  # defaults to yesterday
+    result = await check_results()  # defaults to yesterday
     summary = result.get("summary", {})
     if summary.get("total", 0) > 0:
         lines = [
@@ -662,6 +828,75 @@ async def fetch_odds_for_upcoming(bot) -> None:
         logger.info(f"Placed {len(paper)} paper bets for {today_str}")
 
 
+async def fetch_closing_odds(bot) -> None:
+    """Fetch closing lines for games that already have opening odds.
+
+    Runs ~10 min before typical first pitch windows. Only fetches for
+    games where the model found 64%+ probability batters, to stay
+    within API budget.
+    """
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+
+    # Which games need closing odds?
+    needs_close = games_needing_closing_odds(today_str)
+    if not needs_close:
+        return
+
+    games = await get_todays_games()
+
+    # Only fetch for games starting within 30 min (closing line window)
+    targets = []
+    for game in games:
+        if game.game_pk not in needs_close:
+            continue
+        if not game.game_time:
+            continue
+        try:
+            game_dt = datetime.fromisoformat(game.game_time.replace("Z", "+00:00"))
+            minutes_until = (game_dt - now).total_seconds() / 60
+            if 0 < minutes_until <= 30:
+                targets.append(game)
+        except Exception:
+            continue
+
+    if not targets:
+        return
+
+    logger.info(f"Fetching closing odds for {len(targets)} games")
+
+    events = await get_events()
+    if not events:
+        return
+
+    for game in targets:
+        event_id = match_event_to_game(events, game.home_team, game.away_team)
+        if not event_id:
+            continue
+
+        try:
+            hit_props = await get_hit_props(event_id)
+        except Exception as e:
+            logger.error(f"Closing odds fetch failed for {event_id}: {e}")
+            continue
+
+        if not hit_props:
+            continue
+
+        for player_name, odds_list in hit_props.items():
+            best = find_best_odds(odds_list)
+            if best and best["best_over"] is not None:
+                update_closing_odds(
+                    game_pk=game.game_pk,
+                    game_date=today_str,
+                    batter_name=player_name,
+                    book=best["best_book"],
+                    closing_over=best["best_over"],
+                )
+
+        logger.info(f"Closing odds saved for {game.away_team}@{game.home_team}")
+
+
 @authorized
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show today's +EV picks with book odds."""
@@ -747,6 +982,79 @@ async def cmd_paper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+@authorized
+async def cmd_drift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check model calibration drift."""
+    result = check_drift()
+    report = format_drift_report(result)
+    await update.message.reply_text(report)
+
+
+@authorized
+async def cmd_ab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show A/B test results comparing primary vs shadow model."""
+    # Optional: /ab 7 for last 7 days
+    days = None
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            pass
+
+    results = compare_models(days_back=days)
+    report = format_ab_report(results)
+    await update.message.reply_text(report)
+
+
+async def auto_drift_check(bot) -> None:
+    """Scheduled drift check — sends alert only on warning/degraded."""
+    logger.info("Running scheduled drift check...")
+    result = check_drift()
+
+    if result["status"] in ("warning", "degraded"):
+        report = format_drift_report(result)
+        try:
+            await bot.send_message(chat_id=CHAT_ID, text=report)
+        except Exception as e:
+            logger.error(f"Failed to send drift alert: {e}")
+    else:
+        logger.info(f"Drift check: {result['status']}")
+
+    # Also settle any shadow predictions while we're at it
+    settled = settle_shadow_predictions()
+    if settled > 0:
+        logger.info(f"Settled {settled} shadow predictions")
+
+
+def backup_database() -> None:
+    """Create a daily backup of the predictions database."""
+    import shutil
+    from pathlib import Path
+    from datetime import date as dt_date
+
+    db_path = Path(__file__).parent / "predictions.db"
+    backup_dir = Path(__file__).parent / "backups"
+    backup_dir.mkdir(exist_ok=True)
+
+    today = dt_date.today().isoformat()
+    backup_path = backup_dir / f"predictions_{today}.db"
+
+    if backup_path.exists():
+        return  # already backed up today
+
+    try:
+        shutil.copy2(db_path, backup_path)
+        logger.info(f"Database backed up to {backup_path}")
+
+        # Keep only last 7 backups
+        backups = sorted(backup_dir.glob("predictions_*.db"))
+        for old in backups[:-7]:
+            old.unlink()
+            logger.info(f"Removed old backup: {old.name}")
+    except Exception as e:
+        logger.error(f"Database backup failed: {e}")
+
+
 async def post_init(app: Application) -> None:
     scheduler = AsyncIOScheduler(timezone="America/New_York")
     loop = asyncio.get_running_loop()
@@ -771,6 +1079,21 @@ async def post_init(app: Application) -> None:
         CronTrigger(hour="10-22", minute="15,45"),
         id="odds_check",
     )
+    scheduler.add_job(
+        lambda: schedule_coro(lambda: fetch_closing_odds(app.bot)),
+        CronTrigger(hour="12-23", minute="50"),
+        id="closing_odds",
+    )
+    scheduler.add_job(
+        lambda: schedule_coro(lambda: auto_drift_check(app.bot)),
+        CronTrigger(hour=9, minute=0),
+        id="drift_check",
+    )
+    scheduler.add_job(
+        backup_database,
+        CronTrigger(hour=3, minute=0),
+        id="db_backup",
+    )
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -788,8 +1111,11 @@ def main():
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("player", cmd_player))
     app.add_handler(CommandHandler("park", cmd_park))
+    app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("paper", cmd_paper))
+    app.add_handler(CommandHandler("drift", cmd_drift))
+    app.add_handler(CommandHandler("ab", cmd_ab))
     app.run_polling(drop_pending_updates=True)
 
 

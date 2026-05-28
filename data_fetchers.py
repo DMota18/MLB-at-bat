@@ -77,18 +77,35 @@ async def get_batter_data(pid: int) -> dict:
             "woba": round(s["woba"], 3) if s.get("woba") else "---",
         }
 
-    # Platoon splits (previous season — need full season for reliability)
-    plat = await _get_splits(pid, "statSplits&sitCodes=vl,vr", PREVIOUS_SEASON, "hitting")
-    platoon = {}
-    for s in plat:
-        side = s.get("split", {}).get("description", "")
-        stat = s.get("stat", {})
-        if "Left" in side:
-            platoon["vs_L"] = {"avg": stat.get("avg", "---"), "obp": stat.get("obp", "---"),
-                               "slg": stat.get("slg", "---"), "pa": stat.get("plateAppearances", 0)}
-        elif "Right" in side:
-            platoon["vs_R"] = {"avg": stat.get("avg", "---"), "obp": stat.get("obp", "---"),
-                               "slg": stat.get("slg", "---"), "pa": stat.get("plateAppearances", 0)}
+    # Platoon splits — blend current + previous season, weighted by PA.
+    # Previous season provides reliability; current season captures changes.
+    plat_prev = await _get_splits(pid, "statSplits&sitCodes=vl,vr", PREVIOUS_SEASON, "hitting")
+    plat_curr = await _get_splits(pid, "statSplits&sitCodes=vl,vr", CURRENT_SEASON, "hitting")
+
+    def _blend_platoon(prev_splits, curr_splits):
+        platoon = {}
+        for side_label, key in [("Left", "vs_L"), ("Right", "vs_R")]:
+            prev = next((s["stat"] for s in prev_splits if side_label in s.get("split", {}).get("description", "")), None)
+            curr = next((s["stat"] for s in curr_splits if side_label in s.get("split", {}).get("description", "")), None)
+            prev_pa = int(prev.get("plateAppearances", 0)) if prev else 0
+            curr_pa = int(curr.get("plateAppearances", 0)) if curr else 0
+            total_pa = prev_pa + curr_pa
+            if total_pa == 0:
+                continue
+            # Weighted blend by PA
+            def blend(stat_name):
+                p_val = float(prev.get(stat_name, "0") if prev else "0") if prev_pa > 0 else 0
+                c_val = float(curr.get(stat_name, "0") if curr else "0") if curr_pa > 0 else 0
+                if prev_pa == 0:
+                    return f"{c_val:.3f}"
+                if curr_pa == 0:
+                    return f"{p_val:.3f}"
+                return f"{(p_val * prev_pa + c_val * curr_pa) / total_pa:.3f}"
+            platoon[key] = {"avg": blend("avg"), "obp": blend("obp"),
+                            "slg": blend("slg"), "pa": total_pa}
+        return platoon
+
+    platoon = _blend_platoon(plat_prev, plat_curr)
     if platoon:
         result["platoon"] = platoon
 

@@ -17,10 +17,14 @@ from matchup_data import (
 )
 from predictor import predict_hit, HitPrediction
 from tracker import save_predictions
+from umpire import get_umpire_from_schedule, umpire_hit_adjustment
+from weather import get_game_weather, weather_hit_adjustment
+from ab_testing import run_shadow_prediction
 
 logger = logging.getLogger("baseball_bot.formatters")
 
 PARK_FACTORS = {
+    # Hitter-friendly (runs >= 1.05)
     "Coors Field": {"hr": 1.35, "runs": 1.28, "tag": "\U0001f4a5"},
     "Great American Ball Park": {"hr": 1.18, "runs": 1.12, "tag": "\U0001f4a5"},
     "Yankee Stadium": {"hr": 1.15, "runs": 1.08, "tag": "\U0001f4a5"},
@@ -29,29 +33,42 @@ PARK_FACTORS = {
     "Globe Life Field": {"hr": 1.10, "runs": 1.05, "tag": "\U0001f4a5"},
     "Minute Maid Park": {"hr": 1.10, "runs": 1.06, "tag": "\U0001f4a5"},
     "Wrigley Field": {"hr": 1.08, "runs": 1.06, "tag": ""},
-    "Camden Yards": {"hr": 1.05, "runs": 1.03, "tag": ""},
-    "Comerica Park": {"hr": 0.92, "runs": 0.95, "tag": ""},
     "Fenway Park": {"hr": 0.95, "runs": 1.05, "tag": ""},
+    "American Family Field": {"hr": 1.08, "runs": 1.05, "tag": ""},
+    # Neutral (0.95 <= runs <= 1.04)
+    "Camden Yards": {"hr": 1.05, "runs": 1.03, "tag": ""},
+    "Rogers Centre": {"hr": 1.02, "runs": 1.01, "tag": ""},
+    "Guaranteed Rate Field": {"hr": 1.00, "runs": 1.00, "tag": ""},
+    "Nationals Park": {"hr": 1.00, "runs": 1.00, "tag": ""},
+    "Truist Park": {"hr": 0.98, "runs": 1.00, "tag": ""},
+    "Target Field": {"hr": 0.98, "runs": 0.99, "tag": ""},
+    "Busch Stadium": {"hr": 0.95, "runs": 0.98, "tag": ""},
+    "loanDepot park": {"hr": 0.95, "runs": 0.97, "tag": ""},
+    "Citi Field": {"hr": 0.95, "runs": 0.97, "tag": ""},
+    "Angel Stadium": {"hr": 0.98, "runs": 0.98, "tag": ""},
+    "PNC Park": {"hr": 0.92, "runs": 0.96, "tag": ""},
+    "Progressive Field": {"hr": 0.95, "runs": 0.97, "tag": ""},
+    # Pitcher-friendly (runs < 0.95)
+    "Comerica Park": {"hr": 0.92, "runs": 0.95, "tag": ""},
     "Dodger Stadium": {"hr": 0.92, "runs": 0.95, "tag": ""},
+    "Kauffman Stadium": {"hr": 0.88, "runs": 0.93, "tag": "\U0001f9ca"},
     "Tropicana Field": {"hr": 0.88, "runs": 0.92, "tag": "\U0001f9ca"},
+    "Oakland Coliseum": {"hr": 0.85, "runs": 0.91, "tag": "\U0001f9ca"},
     "Petco Park": {"hr": 0.85, "runs": 0.90, "tag": "\U0001f9ca"},
     "T-Mobile Park": {"hr": 0.82, "runs": 0.90, "tag": "\U0001f9ca"},
     "Oracle Park": {"hr": 0.78, "runs": 0.88, "tag": "\U0001f9ca"},
 }
-
-_player_cache: dict[str, int] = {}
-
 
 def _find_pitcher_id(name: str) -> int | None:
     """Find pitcher ID by name using the lineup detector's cached bios."""
     for pid, bio in _player_bios.items():
         if bio.get("fullName") == name:
             return pid
-    return _player_cache.get(name)
+    return None
 
 
 def format_pitcher_block(name: str, throws: str | None, data: dict) -> str:
-    """Format pitcher stat block."""
+    """Format pitcher stat block with advanced stats."""
     t = f"({throws}HP)" if throws else ""
     lines = [f"\U0001f3af {name} {t}"]
 
@@ -77,16 +94,6 @@ def format_pitcher_block(name: str, throws: str | None, data: dict) -> str:
         if parts:
             lines.append(f"  {' | '.join(parts)}")
 
-    plat = data.get("platoon", {})
-    if plat:
-        parts = []
-        for side in ["vs_LHB", "vs_RHB"]:
-            if side in plat:
-                p = plat[side]
-                parts.append(f"{side}: {p['avg']}/{p['obp']}/{p['slg']} ({p['k']}K {p['hr']}HR)")
-        if parts:
-            lines.append(f"  Splits: {' | '.join(parts)}")
-
     return "\n".join(lines)
 
 
@@ -94,52 +101,25 @@ def format_batter_matchup(
     batter: PlayerInfo, pitcher_throws: str | None, data: dict,
     pred: HitPrediction | None = None,
 ) -> str:
-    """Format one batter's matchup data with prediction."""
+    """Format one batter's matchup — condensed view.
+
+    Shows tier + probability, edge tags, and season slash line.
+    Advanced stats available via /player command.
+    """
     if pred:
         prob_pct = f"{pred.hit_probability * 100:.0f}%"
         fair_odds = prob_to_american(pred.hit_probability)
-        lines = [f"{pred.tier_emoji} {batter.batting_order}. {batter.name} ({batter.bats}) — {pred.tier} ({prob_pct} / {fair_odds}) [{pred.confidence}]"]
+        lines = [f"{pred.tier_emoji} {batter.batting_order}. {batter.name} ({batter.bats}) — {pred.tier} ({prob_pct} / {fair_odds})"]
         if pred.edge:
-            lines.append(f"   Edge: {pred.edge}")
+            lines[0] += f"  {pred.edge}"
     else:
         lines = [f"{batter.batting_order}. {batter.name} ({batter.bats})"]
 
     s = data.get("season")
     if s and int(s.get("pa", 0)) > 0:
-        lines.append(f"   {s['avg']}/{s['obp']}/{s['slg']}  {s['hr']}HR {s['k']}K {s['bb']}BB  ({s['pa']}PA)")
+        lines.append(f"   {s['avg']}/{s['obp']}/{s['slg']}  {s['hr']}HR  ({s['pa']}PA)")
     else:
         lines.append(f"   No {CURRENT_SEASON} stats")
-
-    adv = data.get("advanced", {})
-    sab = data.get("saber", {})
-    parts = []
-    if adv.get("babip") and adv["babip"] != "---":
-        parts.append(f"BABIP {adv['babip']}")
-    if adv.get("iso") and adv["iso"] != "---":
-        parts.append(f"ISO {adv['iso']}")
-    if adv.get("k_pct") and adv["k_pct"] != "---":
-        parts.append(f"K% {adv['k_pct']}")
-    if adv.get("bb_pct") and adv["bb_pct"] != "---":
-        parts.append(f"BB% {adv['bb_pct']}")
-    if sab.get("woba") and sab["woba"] != "---":
-        parts.append(f"wOBA {sab['woba']}")
-    if parts:
-        lines.append(f"   {' | '.join(parts)}")
-
-    plat = data.get("platoon", {})
-    if pitcher_throws and plat:
-        key = "vs_L" if pitcher_throws == "L" else "vs_R"
-        if key in plat:
-            p = plat[key]
-            lines.append(f"   '{PREVIOUS_SEASON % 100} {key}: {p['avg']}/{p['obp']}/{p['slg']} ({p['pa']}PA)")
-
-    if pitcher_throws:
-        if (batter.bats == "L" and pitcher_throws == "R") or (batter.bats == "R" and pitcher_throws == "L"):
-            lines.append("   \u2705 Platoon edge")
-        elif batter.bats == pitcher_throws:
-            lines.append("   \u26a0\ufe0f Same-hand")
-        elif batter.bats == "S":
-            lines.append("   \u21c4 Switch")
 
     last7 = data.get("last7")
     if last7 and int(last7.get("ab", 0)) > 0:
@@ -164,7 +144,36 @@ async def build_pregame_card(game: GameLineup) -> str:
 
     pf = PARK_FACTORS.get(game.venue, {"hr": 1.00, "runs": 1.00, "tag": ""})
     lines.append(f"\U0001f3df {game.venue}  HR {pf['hr']}x  Runs {pf['runs']}x {pf.get('tag','')}")
+
+    # Weather
+    weather = await get_game_weather(game.venue, game.game_time or "")
+    w_adj = weather_hit_adjustment(weather)
+    if weather.get("has_data"):
+        if weather.get("is_indoor"):
+            lines.append("\U0001f3e0 Indoor (climate controlled)")
+        else:
+            wind_dir = weather.get("wind_direction", 0)
+            lines.append(
+                f"\U0001f321 {weather['temperature_f']:.0f}\u00b0F  "
+                f"\U0001f4a8 {weather['wind_speed_mph']:.0f}mph ({wind_dir}\u00b0)"
+            )
+    # Umpire
+    ump = await get_umpire_from_schedule({"officials": game.officials})
+    u_adj = umpire_hit_adjustment(ump)
+    if ump.get("has_data"):
+        bias = ump["zone_bias"]
+        if bias > 0.005:
+            zone_label = "wide zone (pitcher-friendly)"
+        elif bias < -0.005:
+            zone_label = "tight zone (batter-friendly)"
+        else:
+            zone_label = "neutral zone"
+        lines.append(f"\U0001f9d1\u200d\u2696\ufe0f HP: {ump['name']} ({zone_label})")
+
     lines.append("")
+
+    # Combined environment adjustment
+    env_adj = w_adj + u_adj
 
     # Pitcher blocks — fetch both in parallel
     away_pitcher_data = {}
@@ -233,7 +242,7 @@ async def build_pregame_card(game: GameLineup) -> str:
             get_batter_statcast(batter.id),
         )
         ars_matchup = compute_arsenal_matchup(batter_vs_pt, arsenal)
-        pred = predict_hit(
+        predict_kwargs = dict(
             batter_data=b_data, pitcher_data=pitcher_data,
             batter_bats=batter.bats, pitcher_throws=pitcher_throws,
             venue=game.venue, park_factors=pf,
@@ -243,7 +252,11 @@ async def build_pregame_card(game: GameLineup) -> str:
             h2h_data=h2h, arsenal_matchup=ars_matchup,
             batting_order=batter.batting_order,
             pitcher_recent=recent, batter_statcast=statcast,
+            weather_adj=env_adj,
         )
+        pred = predict_hit(**predict_kwargs)
+        # Run shadow model (no-op if none registered)
+        run_shadow_prediction(**predict_kwargs)
         return b_data, pred
 
     # Away lineup vs home pitcher

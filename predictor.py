@@ -141,6 +141,7 @@ def predict_hit(
     bullpen_avg: float = 0.248,
     pitcher_recent: dict | None = None,
     batter_statcast: dict | None = None,
+    weather_adj: float = 0.0,
 ) -> HitPrediction:
     """Predict whether a batter gets at least 1 hit in the full game."""
     factors = PredictionFactors()
@@ -319,6 +320,10 @@ def predict_hit(
     # regression up; soft contact with high AVG will regress down.
     if statcast_adj != 0.0:
         per_ab += statcast_adj
+
+    # Weather adjustment (temperature + wind effects)
+    if weather_adj != 0.0:
+        per_ab += weather_adj
 
     # Platoon multiplier
     if factors.platoon_edge:
