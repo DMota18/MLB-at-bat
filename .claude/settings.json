@@ -1,0 +1,53 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest *)",
+      "Bash(python -m pytest *)",
+      "Bash(ruff check *)",
+      "Bash(ruff format *)",
+      "Bash(mypy *)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git diff*)",
+      "Bash(git branch*)",
+      "Bash(git show*)",
+      "Bash(git blame*)",
+      "Bash(pip list*)",
+      "Bash(pip show*)",
+      "Bash(python stats_check.py*)",
+      "Bash(python tier_check.py*)",
+      "Bash(python debug_savant.py*)",
+      "Bash(python recent_stats.py*)",
+      "Bash(python medium_stats.py*)",
+      "Bash(python full_stats.py*)",
+      "Bash(python auditor.py*)",
+      "Bash(python export_tableau.py*)",
+      "Bash(python walk_forward.py*)",
+      "Bash(python backtest.py*)",
+      "Bash(python drift.py*)",
+      "Bash(sqlite3 *)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(python bot.py*)",
+      "Bash(*deploy.sh*)",
+      "Bash(git push*)",
+      "Bash(git reset --hard*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; if [ -n \"$f\" ] && echo \"$f\" | grep -qE '\\.py$'; then ruff check --fix \"$f\" 2>/dev/null || true; fi; }",
+            "timeout": 10,
+            "statusMessage": "Running ruff..."
+          }
+        ]
+      }
+    ]
+  }
+}
