@@ -9,6 +9,9 @@ dist/
 build/
 .pytest_cache/
 
+# Generated data
+statcast_cache.json
+
 # Local analysis scripts
 backtest.py
 backtest_compare.py

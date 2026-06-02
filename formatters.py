@@ -13,7 +13,9 @@ from data_fetchers import get_batter_data, get_pitcher_data
 from lineup_detector import GameLineup, PlayerInfo, _player_bios
 from matchup_data import (
     get_h2h, get_pitcher_arsenal, get_batter_vs_pitch_types,
+    get_batter_pitch_type_stats,
     compute_arsenal_matchup, get_pitcher_recent_starts, get_batter_statcast,
+    clear_statcast_cache,
 )
 from predictor import predict_hit, HitPrediction
 from tracker import save_predictions
@@ -130,6 +132,7 @@ def format_batter_matchup(
 
 async def build_pregame_card(game: GameLineup) -> str:
     """Build full pregame matchup card."""
+    clear_statcast_cache()  # fresh data for each game card
     lines = []
 
     game_time = ""
@@ -238,7 +241,7 @@ async def build_pregame_card(game: GameLineup) -> str:
         b_data, h2h, batter_vs_pt, statcast = await asyncio.gather(
             get_batter_data(batter.id),
             get_h2h(batter.id, pitcher_id) if pitcher_id else _empty_dict(),
-            get_batter_vs_pitch_types(batter.id),
+            get_batter_pitch_type_stats(batter.id),
             get_batter_statcast(batter.id),
         )
         ars_matchup = compute_arsenal_matchup(batter_vs_pt, arsenal)

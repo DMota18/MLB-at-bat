@@ -52,7 +52,7 @@ def get_client() -> httpx.AsyncClient:
             transport=transport,
             timeout=20,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            headers={"User-Agent": "baseball-bot/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; BaseballResearch/1.0)"},
             follow_redirects=True,
         )
     return _client

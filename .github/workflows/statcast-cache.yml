@@ -1,0 +1,43 @@
+name: Statcast Cache
+
+on:
+  schedule:
+    - cron: '0 11 * * *'  # 7 AM ET daily (11 UTC)
+  workflow_dispatch:       # manual trigger
+
+jobs:
+  build-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Build Statcast cache
+        run: python statcast_cache.py --batters 300
+
+      - name: Upload cache artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: statcast-cache
+          path: statcast_cache.json
+          retention-days: 3
+
+      - name: Deploy cache to server
+        if: env.DEPLOY_HOST != ''
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+        run: |
+          echo "$DEPLOY_KEY" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          scp -o StrictHostKeyChecking=no -i /tmp/deploy_key \
+            statcast_cache.json \
+            "$DEPLOY_HOST:/home/ubuntu/baseball-bot/"
+          rm /tmp/deploy_key

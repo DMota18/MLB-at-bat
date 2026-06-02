@@ -12,6 +12,8 @@ import io
 import logging
 from typing import Any
 
+from collections import defaultdict
+
 from config import MLB_API, SAVANT_CSV, CURRENT_SEASON, PREVIOUS_SEASON, fetch_json, fetch_text
 
 logger = logging.getLogger("baseball_bot.matchup")
@@ -155,6 +157,15 @@ def _compute_xba(
 
 # ── Batter Statcast (pitch types + contact quality in one call) ──────
 
+# Per-session cache: avoids duplicate Savant requests when both
+# get_batter_vs_pitch_types() and get_batter_statcast() are called
+# for the same batter in the same game card analysis.
+_statcast_cache: dict[tuple[int, int], dict[str, Any]] = {}
+
+
+def clear_statcast_cache() -> None:
+    """Clear the per-session Statcast cache (call between game cards)."""
+    _statcast_cache.clear()
 
 
 async def get_batter_statcast_all(
@@ -166,6 +177,9 @@ async def get_batter_statcast_all(
     replacing the old get_batter_vs_pitch_types + get_batter_statcast
     which made two identical requests.
 
+    Results are cached per (batter_id, season) for the session to avoid
+    duplicate API calls when multiple wrappers call this function.
+
     Returns:
         {
             "pitch_stats": {code: {ab, hits, avg, hr, k}},
@@ -173,6 +187,12 @@ async def get_batter_statcast_all(
         }
     """
     season = season or CURRENT_SEASON
+
+    # Check cache first
+    cache_key = (batter_id, season)
+    if cache_key in _statcast_cache:
+        return _statcast_cache[cache_key]
+
     # Use current season if past mid-April (enough data), otherwise previous
     from datetime import date
     today = date.today()
@@ -203,8 +223,13 @@ async def get_batter_statcast_all(
     }
 
     try:
+        # Stagger Savant requests to avoid rate limiting on VPS
+        import asyncio
+        await asyncio.sleep(0.3)
+
         text = await fetch_text(SAVANT_CSV, params=params)
         if len(text) < 200:
+            logger.warning(f"Savant returned short response for {batter_id}: {len(text)} bytes")
             return empty
 
         # Strip BOM that Baseball Savant prepends to CSV responses
@@ -299,7 +324,9 @@ async def get_batter_statcast_all(
                 "xba": _compute_xba(exit_velos, batted_balls, hard_hits, barrels),
             }
 
-        return {"pitch_stats": pitch_stats, "contact": contact}
+        result = {"pitch_stats": pitch_stats, "contact": contact}
+        _statcast_cache[cache_key] = result
+        return result
 
     except Exception as e:
         logger.warning(f"Statcast lookup failed for {batter_id}: {e}")
@@ -416,6 +443,60 @@ async def get_pitcher_recent_starts(pitcher_id: int, num_starts: int = 3) -> dic
         return {"has_data": False}
 
 
+# ── Batter pitch type stats via MLB Stats API ──────────────────────
+# Aggregates the playLog endpoint into per-pitch-type batting stats.
+# Unlike Savant, this endpoint works reliably from VPS IPs.
+
+
+async def get_batter_pitch_type_stats(
+    batter_id: int, season: int | None = None,
+) -> dict[str, dict]:
+    """Get batter's batting stats against each pitch type via MLB Stats API.
+
+    Uses the playLog endpoint and aggregates at-bats by the pitch type
+    on the final pitch of each plate appearance. Returns the same shape
+    as the old Savant-based get_batter_vs_pitch_types() so
+    compute_arsenal_matchup() works without changes.
+    """
+    season = season or CURRENT_SEASON
+    try:
+        data = await fetch_json(
+            f"{MLB_API}/people/{batter_id}/stats"
+            f"?stats=playLog&season={season}&group=hitting"
+        )
+        splits = data.get("stats", [{}])[0].get("splits", [])
+        if not splits:
+            return {}
+
+        hit_events = {"single", "double", "triple", "home_run"}
+        stats: dict[str, dict] = defaultdict(lambda: {"ab": 0, "hits": 0, "hr": 0, "k": 0})
+
+        for s in splits:
+            details = s.get("stat", {}).get("play", {}).get("details", {})
+            if not details.get("isAtBat"):
+                continue
+            pt_code = details.get("type", {}).get("code", "")
+            if not pt_code:
+                continue
+
+            stats[pt_code]["ab"] += 1
+            if details.get("isBaseHit"):
+                stats[pt_code]["hits"] += 1
+            event = details.get("event", "")
+            if event == "home_run":
+                stats[pt_code]["hr"] += 1
+            if event in ("strikeout", "strikeout_double_play"):
+                stats[pt_code]["k"] += 1
+
+        for s in stats.values():
+            s["avg"] = round(s["hits"] / s["ab"], 3) if s["ab"] > 0 else 0
+
+        return dict(stats)
+    except Exception as e:
+        logger.warning(f"Batter pitch type stats failed for {batter_id}: {e}")
+        return {}
+
+
 # ── Legacy compatibility wrappers ────────────────────────────────
 # These wrap the combined get_batter_statcast_all for callers that
 # expect the old separate interfaces.
@@ -428,6 +509,32 @@ async def get_batter_vs_pitch_types(batter_id: int) -> dict[str, dict]:
 
 
 async def get_batter_statcast(batter_id: int) -> dict[str, Any]:
-    """Get batter's contact quality metrics. Wrapper around combined call."""
+    """Get batter's contact quality metrics.
+
+    Checks the local Statcast cache first (populated by statcast_cache.py).
+    Falls back to a live Savant call if the cache misses (unlikely to
+    succeed on a VPS, but works from residential IPs).
+    """
+    cached = _read_statcast_cache(batter_id)
+    if cached:
+        return cached
     result = await get_batter_statcast_all(batter_id)
     return result.get("contact", {"has_data": False})
+
+
+def _read_statcast_cache(batter_id: int) -> dict[str, Any] | None:
+    """Read a batter's Statcast data from the local cache file."""
+    import json
+    from pathlib import Path
+
+    cache_path = Path(__file__).parent / "statcast_cache.json"
+    if not cache_path.exists():
+        return None
+
+    if not hasattr(_read_statcast_cache, "_data"):
+        try:
+            _read_statcast_cache._data = json.loads(cache_path.read_text())
+        except Exception:
+            _read_statcast_cache._data = {}
+
+    return _read_statcast_cache._data.get(str(batter_id))
