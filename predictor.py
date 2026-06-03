@@ -252,10 +252,10 @@ def predict_hit(
         factors.hard_hit_pct = hh
 
         # Adjust per-AB prob based on quality of contact.
-        # League avg exit velo ~88.5, hard hit ~35%.
-        # A batter with 92 mph / 45% hard hit is underperforming his AVG.
-        ev_diff = (ev - 88.5) / 100   # e.g., +0.035 for 92 mph
-        hh_diff = (hh - 0.35) * 0.10  # e.g., +0.01 for 45% hard hit
+        # Baselines are mean across all batted balls from Savant CSV
+        # (includes bunts, weak grounders — lower than leaderboard figures).
+        ev_diff = (ev - 83.0) / 100
+        hh_diff = (hh - 0.255) * 0.10
         statcast_adj = ev_diff + hh_diff  # Will be added to per_ab later
 
     # ── COMBINE INTO PER-AB PROBABILITY ──────────────────────────
