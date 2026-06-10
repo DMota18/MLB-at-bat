@@ -20,6 +20,7 @@
       "Bash(python recent_stats.py*)",
       "Bash(python medium_stats.py*)",
       "Bash(python full_stats.py*)",
+      "Bash(python stats.py*)",
       "Bash(python auditor.py*)",
       "Bash(python export_tableau.py*)",
       "Bash(python walk_forward.py*)",

@@ -515,12 +515,11 @@ def update_closing_odds(
 
 
 def games_needing_closing_odds(game_date: str) -> set[int]:
-    """Get game_pks that have opening odds but no closing odds yet, and have 64%+ model prob."""
+    """Get game_pks that have opening odds but no closing odds yet."""
     with contextlib.closing(_get_db()) as db:
         rows = db.execute("""
             SELECT DISTINCT game_pk FROM book_odds
             WHERE game_date = ? AND line = 0.5
-              AND model_prob >= 0.64
               AND closing_over_price IS NULL
         """, (game_date,)).fetchall()
     return {r["game_pk"] for r in rows}
@@ -603,11 +602,11 @@ def games_with_odds(game_date: str) -> set[int]:
 def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
     """Pick the top +EV bets for a date from stored odds and predictions.
 
-    Selects the best edge bets: model_prob >= 0.64, edge > 0.02,
+    Selects the best edge bets: model_prob >= 0.55, edge > 0.01,
     ranked by edge. Saves to paper_bets table. Returns the placed bets.
 
-    Thresholds tuned on 1,113 batter-game odds entries (Apr 5 - May 1):
-      prob >= 64%, edge > 2% -> 68.7% win rate, +10.9% ROI
+    Thresholds lowered to increase volume for statistical significance.
+    Previous: prob >= 64%, edge > 2% -> 68.7% win rate, +10.9% ROI (n=68)
     """
     with contextlib.closing(_get_db()) as db:
         existing = db.execute(
@@ -623,8 +622,8 @@ def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
             JOIN predictions p ON bo.game_pk = p.game_pk AND bo.batter_name = p.batter_name
             WHERE bo.game_date = ?
               AND bo.line = 0.5
-              AND bo.model_prob >= 0.64
-              AND bo.edge > 0.02
+              AND bo.model_prob >= 0.55
+              AND bo.edge > 0.01
               AND p.prediction = 'HIT'
             ORDER BY bo.edge DESC
         """, (game_date,)).fetchall()

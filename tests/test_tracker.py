@@ -319,9 +319,9 @@ def test_place_paper_bets_no_duplicates():
 def test_place_paper_bets_filters_low_prob():
     from tracker import save_predictions, save_book_odds, place_paper_bets
 
-    # Prediction below 0.64 threshold
-    save_predictions([_make_prediction(batter_id=1, batter_name="Weak", prediction="HIT", hit_probability=0.55)])
-    save_book_odds(717001, "2026-05-01", "Weak", 1, 0.55,
+    # Prediction below 0.55 threshold
+    save_predictions([_make_prediction(batter_id=1, batter_name="Weak", prediction="HIT", hit_probability=0.40)])
+    save_book_odds(717001, "2026-05-01", "Weak", 1, 0.40,
                    [{"book": "DK", "over": +120, "under": -140, "line": 0.5}])
 
     bets = place_paper_bets("2026-05-01")
@@ -558,7 +558,7 @@ def test_games_needing_closing_odds():
     save_book_odds(717002, "2026-05-01", "Weak", 2, 0.50,
                    [{"book": "DK", "over": +120, "under": -140, "line": 0.5}])
 
-    # Only game with 64%+ model prob should be returned
+    # All games with opening odds should be returned
     needs = games_needing_closing_odds("2026-05-01")
     assert 717001 in needs
-    assert 717002 not in needs
+    assert 717002 in needs

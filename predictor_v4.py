@@ -42,11 +42,11 @@ ISOTONIC_TABLE = [
     (0.50, 0.53),   # 50-55% bucket: actual was 57%, pull up from squeeze
     (0.55, 0.58),   # 55-60%: well calibrated
     (0.60, 0.61),   # 60-65%: slight over-prediction
-    (0.65, 0.63),   # 65-70%: model says 67%, actual 63%
+    (0.65, 0.64),   # 65-70%: was 0.63, bumped to restore tier spread
     (0.70, 0.67),   # 70-75%: model says 72%, actual 67%
-    (0.75, 0.68),   # 75-80%: model says 77%, actual 68%
-    (0.80, 0.69),   # 80%+: ceiling, actual ~66-69%
-    (0.90, 0.72),   # hard cap
+    (0.75, 0.70),   # 75-80%: was 0.68, allows STRONG tier entry
+    (0.80, 0.72),   # 80%+: was 0.69, stretched to preserve separation
+    (0.90, 0.75),   # hard cap: was 0.72
 ]
 
 

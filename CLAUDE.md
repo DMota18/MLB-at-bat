@@ -81,6 +81,15 @@ MLB Stats API → lineup_detector (poll) → data_fetchers + matchup_data (paral
 - **deploy.sh hardcodes file list**: When adding new modules, update the `scp` line in `deploy.sh`.
 - **Retractable roofs**: 8 venues skip weather adjustments. List is in `weather.py`.
 
+## Production (EC2)
+
+- **Host:** `ubuntu@<your-ec2-ip>`
+- **SSH key:** `~/.ssh/your-key.pem`
+- **Remote path:** `/home/ubuntu/baseball-bot/`
+- **Sync DB:** `scp -i ~/.ssh/your-key.pem ubuntu@<your-ec2-ip>:/home/ubuntu/baseball-bot/predictions.db ./predictions_latest.db`
+
+The bot runs 24/7 on EC2. The local `predictions.db` is empty; always use `predictions_latest.db` (synced from EC2) for stats queries.
+
 ## Environment Variables
 
 | Variable | Required | Description |
@@ -88,8 +97,8 @@ MLB Stats API → lineup_detector (poll) → data_fetchers + matchup_data (paral
 | `TELEGRAM_BOT_TOKEN` | Yes | Telegram Bot API token |
 | `TELEGRAM_CHAT_ID` | Yes | Target chat ID for predictions |
 | `ODDS_API_KEY` | No | The Odds API key (odds features disabled without) |
-| `DEPLOY_HOST` | Deploy only | SSH target (e.g., ubuntu@1.2.3.4) |
-| `DEPLOY_KEY` | Deploy only | Path to SSH private key |
+| `DEPLOY_HOST` | Deploy only | SSH target (`ubuntu@<your-ec2-ip>`) |
+| `DEPLOY_KEY` | Deploy only | Path to SSH key (`~/.ssh/your-key.pem`) |
 
 ## Testing
 
@@ -104,9 +113,25 @@ pytest tests/test_drift.py -v       # model health monitoring
 pytest tests/test_ab_testing.py -v  # shadow model framework
 ```
 
-## Model Performance (as of May 30, 2026)
+## Model Performance (as of Jun 7, 2026)
 
-- 6,750+ settled predictions (Apr 5 – May 26)
+- 8,300+ settled predictions (Apr 5 – Jun 7)
 - STRONG HIT: 67.0% accuracy | LEAN HIT: 62% | TOSS-UP: 59% | FADE: 54%
 - ECE: 0.029 | Brier: 0.240 | ROC-AUC: 0.555
 - Paper betting: 46W/22L, +$408, +6% ROI
+- MLB-wide hit rate in our data: ~60%
+
+## Success Thresholds
+
+When reporting stats, flag anything that crosses these lines:
+
+| Metric | Threshold | Status |
+|---|---|---|
+| **Overall accuracy** | Must beat MLB daily hit rate (~60%) | RED if below league avg for the period |
+| **High tier accuracy** | ≥ 75% | RED if below — the top tier must be reliable |
+| **Tier separation** (high - low) | ≥ 10pp | RED if below — tiers aren't differentiating |
+| **Paper bet ROI** | ≥ 0% | RED if negative over a 7+ day window |
+| **Brier score** | ≤ 0.245 | RED if above — calibration is drifting |
+| **Single-day accuracy** | ≥ 55% | YELLOW if any day drops below this |
+
+Use GREEN / YELLOW / RED in stats output. One bad day is variance; a bad week is a signal.

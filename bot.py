@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
@@ -662,19 +663,46 @@ async def auto_check_results(bot) -> None:
             logger.error(f"Failed to send paper results: {e}")
 
 
+_SUFFIXES = {"jr.", "sr.", "ii", "iii", "iv", "v"}
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a player name for matching: strip accents, suffixes, and lowercase."""
+    nfkd = unicodedata.normalize("NFKD", name)
+    ascii_name = "".join(c for c in nfkd if not unicodedata.combining(c))
+    parts = [p for p in ascii_name.lower().split() if p.rstrip(".") not in _SUFFIXES]
+    return " ".join(parts)
+
+
 def _lookup_odds(game_odds: dict[str, dict], batter_name: str) -> dict | None:
-    """Look up odds for a batter, handling name format differences."""
+    """Look up odds for a batter, handling name format differences.
+
+    Handles accent mismatches (José Ramírez vs Jose Ramirez) and
+    suffix differences (Vladimir Guerrero Jr. vs Vladimir Guerrero).
+    """
     if not game_odds:
         return None
 
     if batter_name in game_odds:
         return game_odds[batter_name]
 
-    batter_last = batter_name.split()[-1].lower() if batter_name else ""
+    norm_batter = _normalize_name(batter_name)
     for name, odds in game_odds.items():
-        if name.split()[-1].lower() == batter_last:
-            if name[0].lower() == batter_name[0].lower():
-                return odds
+        if _normalize_name(name) == norm_batter:
+            return odds
+
+    # Fallback: last-name + first-initial match
+    batter_parts = norm_batter.split()
+    if not batter_parts:
+        return None
+    batter_last = batter_parts[-1]
+    batter_initial = batter_parts[0][0] if batter_parts[0] else ""
+    for name, odds in game_odds.items():
+        norm_parts = _normalize_name(name).split()
+        if not norm_parts:
+            continue
+        if norm_parts[-1] == batter_last and norm_parts[0][0] == batter_initial:
+            return odds
 
     return None
 
@@ -692,7 +720,7 @@ async def fetch_odds_for_upcoming(bot) -> None:
     # Which games already have odds?
     already_fetched = games_with_odds(today_str)
 
-    # Find games starting within 60-100 min (sweet spot for odds availability)
+    # Find games starting within 120 min
     targets = []
     for game in games:
         if game.game_pk in already_fetched:
@@ -702,7 +730,7 @@ async def fetch_odds_for_upcoming(bot) -> None:
         try:
             game_dt = datetime.fromisoformat(game.game_time.replace("Z", "+00:00"))
             minutes_until = (game_dt - now).total_seconds() / 60
-            if 0 < minutes_until <= 100:
+            if 0 < minutes_until <= 120:
                 targets.append(game)
         except Exception:
             continue
@@ -757,7 +785,10 @@ async def fetch_odds_for_upcoming(bot) -> None:
             if not matched_pred:
                 matched_pred = pred_map.get((game.game_pk, player_name))
 
-            model_prob = matched_pred["hit_probability"] if matched_pred else 0.0
+            if not matched_pred:
+                continue
+
+            model_prob = matched_pred["hit_probability"]
 
             # Save all book odds
             best = find_best_odds(odds_list)
@@ -772,9 +803,9 @@ async def fetch_odds_for_upcoming(bot) -> None:
                 odds_saved += 1
 
                 # Track +EV picks
-                if matched_pred and model_prob >= 0.65:
+                if matched_pred and model_prob >= 0.55:
                     edge = model_prob - best["implied_prob"]
-                    if edge > 0.02:  # At least 2% edge
+                    if edge > 0.01:
                         ev_picks.append({
                             "name": player_name,
                             "model_prob": model_prob,
@@ -811,7 +842,7 @@ async def fetch_odds_for_upcoming(bot) -> None:
             logger.error(f"Failed to send +EV alert: {e}")
 
     # Auto-place paper bets for today
-    paper = place_paper_bets(today_str, max_bets=10)
+    paper = place_paper_bets(today_str, max_bets=30)
     if paper:
         plines = [f"\U0001f4dd Paper Bets Placed — {today_str}\n"]
         for i, b in enumerate(paper, 1):
@@ -831,9 +862,7 @@ async def fetch_odds_for_upcoming(bot) -> None:
 async def fetch_closing_odds(bot) -> None:
     """Fetch closing lines for games that already have opening odds.
 
-    Runs ~10 min before typical first pitch windows. Only fetches for
-    games where the model found 64%+ probability batters, to stay
-    within API budget.
+    Runs twice hourly. Fetches for all games with opening odds.
     """
     now = datetime.now(timezone.utc)
     today_str = now.strftime("%Y-%m-%d")
@@ -918,11 +947,11 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Sort by edge
     ranked = sorted(best_by_batter.values(), key=lambda x: -x["edge"])
-    ev_picks = [r for r in ranked if r["edge"] > 0.02 and r["model_prob"] >= 0.65]
+    ev_picks = [r for r in ranked if r["edge"] > 0.01 and r["model_prob"] >= 0.55]
 
     if not ev_picks:
         await update.message.reply_text(
-            f"Odds fetched for {len(best_by_batter)} batters today but no +EV picks found (need 2%+ edge and 65%+ model prob)."
+            f"Odds fetched for {len(best_by_batter)} batters today but no +EV picks found (need 1%+ edge and 55%+ model prob)."
         )
         return
 
@@ -1076,12 +1105,12 @@ async def post_init(app: Application) -> None:
     )
     scheduler.add_job(
         lambda: schedule_coro(lambda: fetch_odds_for_upcoming(app.bot)),
-        CronTrigger(hour="10-22", minute="15,45"),
+        CronTrigger(hour="10-23", minute="0,15,30,45"),
         id="odds_check",
     )
     scheduler.add_job(
         lambda: schedule_coro(lambda: fetch_closing_odds(app.bot)),
-        CronTrigger(hour="12-23", minute="50"),
+        CronTrigger(hour="12-23", minute="10,40"),
         id="closing_odds",
     )
     scheduler.add_job(
