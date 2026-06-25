@@ -316,12 +316,32 @@ def test_place_paper_bets_no_duplicates():
     assert len(bets2) == 0  # no duplicates
 
 
+def test_place_paper_bets_incremental():
+    from tracker import save_predictions, save_book_odds, place_paper_bets
+
+    save_predictions([_make_prediction(batter_id=1, batter_name="Judge", prediction="HIT", hit_probability=0.72)])
+    save_book_odds(717001, "2026-05-01", "Judge", 1, 0.72,
+                   [{"book": "DK", "over": -170, "under": 130, "line": 0.5}])
+
+    bets1 = place_paper_bets("2026-05-01")
+    assert len(bets1) == 1
+
+    # Later game posts odds — new batter should be picked up
+    save_predictions([_make_prediction(game_pk=717002, batter_id=2, batter_name="Soto", prediction="HIT", hit_probability=0.70)])
+    save_book_odds(717002, "2026-05-01", "Soto", 2, 0.70,
+                   [{"book": "DK", "over": -160, "under": 120, "line": 0.5}])
+
+    bets2 = place_paper_bets("2026-05-01")
+    assert len(bets2) == 1
+    assert bets2[0]["batter_name"] == "Soto"
+
+
 def test_place_paper_bets_filters_low_prob():
     from tracker import save_predictions, save_book_odds, place_paper_bets
 
-    # Prediction below 0.55 threshold
-    save_predictions([_make_prediction(batter_id=1, batter_name="Weak", prediction="HIT", hit_probability=0.40)])
-    save_book_odds(717001, "2026-05-01", "Weak", 1, 0.40,
+    # Prediction below 0.70 threshold
+    save_predictions([_make_prediction(batter_id=1, batter_name="Weak", prediction="HIT", hit_probability=0.65)])
+    save_book_odds(717001, "2026-05-01", "Weak", 1, 0.65,
                    [{"book": "DK", "over": +120, "under": -140, "line": 0.5}])
 
     bets = place_paper_bets("2026-05-01")
@@ -468,8 +488,8 @@ def test_games_with_odds():
 def test_settle_positive_odds_payout():
     from tracker import save_predictions, save_book_odds, place_paper_bets, settle_paper_bets, _get_db
 
-    save_predictions([_make_prediction(batter_id=1, batter_name="Underdog", prediction="HIT", hit_probability=0.66)])
-    save_book_odds(717001, "2026-05-01", "Underdog", 1, 0.66,
+    save_predictions([_make_prediction(batter_id=1, batter_name="Underdog", prediction="HIT", hit_probability=0.72)])
+    save_book_odds(717001, "2026-05-01", "Underdog", 1, 0.72,
                    [{"book": "BetMGM", "over": 110, "under": -130, "line": 0.5}])
     place_paper_bets("2026-05-01")
 

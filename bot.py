@@ -708,29 +708,25 @@ def _lookup_odds(game_odds: dict[str, dict], batter_name: str) -> dict | None:
 
 
 async def fetch_odds_for_upcoming(bot) -> None:
-    """Fetch book odds for games starting within 90 minutes.
+    """Fetch book odds for upcoming games.
 
-    Runs on a schedule. Only fetches once per game. Stores all odds
-    in the database for backtesting, then sends a +EV alert to Telegram.
+    Runs every 5 min. Re-fetches to catch line movement — new odds
+    overwrite old ones via save_book_odds (INSERT OR REPLACE on
+    game_pk + batter + book). Paper bets placed incrementally.
     """
     now = datetime.now(timezone.utc)
     games = await get_todays_games()
     today_str = now.strftime("%Y-%m-%d")
 
-    # Which games already have odds?
-    already_fetched = games_with_odds(today_str)
-
-    # Find games starting within 120 min
+    # Find games starting within 180 min
     targets = []
     for game in games:
-        if game.game_pk in already_fetched:
-            continue
         if not game.game_time:
             continue
         try:
             game_dt = datetime.fromisoformat(game.game_time.replace("Z", "+00:00"))
             minutes_until = (game_dt - now).total_seconds() / 60
-            if 0 < minutes_until <= 120:
+            if 0 < minutes_until <= 180:
                 targets.append(game)
         except Exception:
             continue
@@ -803,9 +799,9 @@ async def fetch_odds_for_upcoming(bot) -> None:
                 odds_saved += 1
 
                 # Track +EV picks
-                if matched_pred and model_prob >= 0.55:
+                if matched_pred and model_prob >= 0.70:
                     edge = model_prob - best["implied_prob"]
-                    if edge > 0.01:
+                    if edge > 0.02:
                         ev_picks.append({
                             "name": player_name,
                             "model_prob": model_prob,
@@ -947,11 +943,11 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Sort by edge
     ranked = sorted(best_by_batter.values(), key=lambda x: -x["edge"])
-    ev_picks = [r for r in ranked if r["edge"] > 0.01 and r["model_prob"] >= 0.55]
+    ev_picks = [r for r in ranked if r["edge"] > 0.02 and r["model_prob"] >= 0.70]
 
     if not ev_picks:
         await update.message.reply_text(
-            f"Odds fetched for {len(best_by_batter)} batters today but no +EV picks found (need 1%+ edge and 55%+ model prob)."
+            f"Odds fetched for {len(best_by_batter)} batters today but no +EV picks found (need 2%+ edge and 70%+ model prob)."
         )
         return
 
@@ -1105,12 +1101,12 @@ async def post_init(app: Application) -> None:
     )
     scheduler.add_job(
         lambda: schedule_coro(lambda: fetch_odds_for_upcoming(app.bot)),
-        CronTrigger(hour="10-23", minute="0,15,30,45"),
+        CronTrigger(hour="10-23", minute="*/5"),
         id="odds_check",
     )
     scheduler.add_job(
         lambda: schedule_coro(lambda: fetch_closing_odds(app.bot)),
-        CronTrigger(hour="12-23", minute="10,40"),
+        CronTrigger(hour="12-23", minute="*/10"),
         id="closing_odds",
     )
     scheduler.add_job(

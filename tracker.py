@@ -73,7 +73,8 @@ def _init_tables(db: sqlite3.Connection) -> None:
             closing_over_price INTEGER DEFAULT NULL,
             closing_implied_prob REAL DEFAULT NULL,
             clv REAL DEFAULT NULL,
-            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(game_pk, batter_name, book, line)
         )
     """)
     # Add CLV columns to existing databases
@@ -81,7 +82,22 @@ def _init_tables(db: sqlite3.Connection) -> None:
         try:
             db.execute(f"ALTER TABLE book_odds ADD COLUMN {col} {typ} DEFAULT NULL")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
+    # Deduplicate before adding unique index (keeps latest by id)
+    try:
+        db.execute("""
+            DELETE FROM book_odds WHERE id NOT IN (
+                SELECT MAX(id) FROM book_odds
+                GROUP BY game_pk, batter_name, book, line
+            )
+        """)
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_book_odds_unique
+            ON book_odds(game_pk, batter_name, book, line)
+        """)
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
     db.execute("""
         CREATE TABLE IF NOT EXISTS daily_summary (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -479,6 +495,12 @@ def save_book_odds(
                     book, line, over_price, under_price,
                     implied_prob, model_prob, edge
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(game_pk, batter_name, book, line) DO UPDATE SET
+                    over_price = excluded.over_price,
+                    under_price = excluded.under_price,
+                    implied_prob = excluded.implied_prob,
+                    edge = excluded.edge,
+                    fetched_at = CURRENT_TIMESTAMP
             """, (
                 game_pk, game_date, batter_name, batter_id,
                 entry.get("book", "unknown"), entry.get("line", 0.5),
@@ -599,22 +621,28 @@ def games_with_odds(game_date: str) -> set[int]:
 # ── Paper betting ────────────────────────────────────────────────
 
 
-def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
+def place_paper_bets(game_date: str, max_bets: int = 30) -> list[dict]:
     """Pick the top +EV bets for a date from stored odds and predictions.
 
-    Selects the best edge bets: model_prob >= 0.55, edge > 0.01,
-    ranked by edge. Saves to paper_bets table. Returns the placed bets.
+    Called on every odds fetch. Skips batters already bet on, places new
+    bets up to max_bets total for the day. This allows incremental betting
+    as later games post lineups and odds throughout the day.
 
-    Thresholds lowered to increase volume for statistical significance.
-    Previous: prob >= 64%, edge > 2% -> 68.7% win rate, +10.9% ROI (n=68)
+    Thresholds set from sweep on 740+ opportunities: 70%+ prob is the only
+    range where hit rate consistently beats the vig across all edge buckets.
     """
     with contextlib.closing(_get_db()) as db:
-        existing = db.execute(
+        existing_count = db.execute(
             "SELECT COUNT(*) as c FROM paper_bets WHERE game_date = ?",
             (game_date,)
         ).fetchone()["c"]
-        if existing > 0:
+        if existing_count >= max_bets:
             return []
+
+        already_bet = {r["batter_name"] for r in db.execute(
+            "SELECT DISTINCT batter_name FROM paper_bets WHERE game_date = ?",
+            (game_date,)
+        ).fetchall()}
 
         rows = db.execute("""
             SELECT bo.*, p.prediction, p.confidence, p.edge as pred_edge, p.pitcher_name
@@ -622,8 +650,8 @@ def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
             JOIN predictions p ON bo.game_pk = p.game_pk AND bo.batter_name = p.batter_name
             WHERE bo.game_date = ?
               AND bo.line = 0.5
-              AND bo.model_prob >= 0.55
-              AND bo.edge > 0.01
+              AND bo.model_prob >= 0.70
+              AND bo.edge > 0.02
               AND p.prediction = 'HIT'
             ORDER BY bo.edge DESC
         """, (game_date,)).fetchall()
@@ -631,14 +659,15 @@ def place_paper_bets(game_date: str, max_bets: int = 10) -> list[dict]:
         if not rows:
             return []
 
-        seen = set()
+        seen = set(already_bet)
         candidates = []
         for r in rows:
             if r["batter_name"] not in seen:
                 seen.add(r["batter_name"])
                 candidates.append(dict(r))
 
-        bets = candidates[:max_bets]
+        slots = max_bets - existing_count
+        bets = candidates[:slots]
 
         for bet in bets:
             odds = bet["over_price"]
